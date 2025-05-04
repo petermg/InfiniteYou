@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import gc
+import os
 
 import gradio as gr
 import pillow_avif
@@ -22,62 +24,85 @@ from pillow_heif import register_heif_opener
 
 from pipelines.pipeline_infu_flux import InfUFluxPipeline
 
+# Parse command-line arguments
+def parse_args():
+    parser = argparse.ArgumentParser(description="InfiniteYou-FLUX Gradio Demo")
+    parser.add_argument('--cuda_device', default=0, type=int, help="CUDA device index")
+    return parser.parse_args()
+
+args = parse_args()
+
+# Set CUDA device
+torch.cuda.set_device(args.cuda_device)
 
 # Register HEIF support for Pillow
 register_heif_opener()
 
+# Flag to track if models have been downloaded
+models_downloaded = False
+
 class ModelVersion:
     STAGE_1 = "sim_stage1"
     STAGE_2 = "aes_stage2"
-
     DEFAULT_VERSION = STAGE_2
     
 ENABLE_ANTI_BLUR_DEFAULT = False
 ENABLE_REALISM_DEFAULT = False
+QUANTIZE_8BIT_DEFAULT = True
+CPU_OFFLOAD_DEFAULT = True
+OUTPUT_DIR = "./results"
 
 loaded_pipeline_config = {
     "model_version": "aes_stage2",
     "enable_realism": False,
     "enable_anti_blur": False,
+    "quantize_8bit": False,
+    "cpu_offload": False,
     'pipeline': None
 }
 
-
 def download_models():
-    snapshot_download(repo_id='ByteDance/InfiniteYou', local_dir='./models/InfiniteYou', local_dir_use_symlinks=False)
-    try:
-        snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
-    except Exception as e:
-        print(e)
-        print('\nYou are downloading `black-forest-labs/FLUX.1-dev` to `./models/FLUX.1-dev` but failed. '
-              'Please accept the agreement and obtain access at https://huggingface.co/black-forest-labs/FLUX.1-dev. '
-              'Then, use `huggingface-cli login` and your access tokens at https://huggingface.co/settings/tokens to authenticate. '
-              'After that, run the code again.')
-        print('\nYou can also download it manually from HuggingFace and put it in `./models/InfiniteYou`, '
-              'or you can modify `base_model_path` in `app.py` to specify the correct path.')
-        exit()
+    global models_downloaded
+    if not models_downloaded:
+        snapshot_download(repo_id='ByteDance/InfiniteYou', local_dir='./models/InfiniteYou', local_dir_use_symlinks=False)
+        try:
+            snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
+        except Exception as e:
+            print(e)
+            print('\nYou are downloading `black-forest-labs/FLUX.1-dev` to `./models/FLUX.1-dev` but failed. '
+                  'Please accept the agreement and obtain access at https://huggingface.co/black-forest-labs/FLUX.1-dev. '
+                  'Then, use `huggingface-cli login` and your access tokens at https://huggingface.co/settings/tokens to authenticate. '
+                  'After that, run the code again.')
+            print('\nYou can also download it manually from HuggingFace and put it in `./models/InfiniteYou`, '
+                  'or you can modify `base_model_path` in `app.py` to specify the correct path.')
+            raise Exception("Model download failed")
+        models_downloaded = True
 
-
-def prepare_pipeline(model_version, enable_realism, enable_anti_blur):
+def prepare_pipeline(model_version, enable_realism, enable_anti_blur, quantize_8bit, cpu_offload):
     if (
         loaded_pipeline_config['pipeline'] is not None
         and loaded_pipeline_config["enable_realism"] == enable_realism 
         and loaded_pipeline_config["enable_anti_blur"] == enable_anti_blur
+        and loaded_pipeline_config["quantize_8bit"] == quantize_8bit
+        and loaded_pipeline_config["cpu_offload"] == cpu_offload
         and model_version == loaded_pipeline_config["model_version"]
     ):
         return loaded_pipeline_config['pipeline']
     
     loaded_pipeline_config["enable_realism"] = enable_realism
     loaded_pipeline_config["enable_anti_blur"] = enable_anti_blur
+    loaded_pipeline_config["quantize_8bit"] = quantize_8bit
+    loaded_pipeline_config["cpu_offload"] = cpu_offload
     loaded_pipeline_config["model_version"] = model_version
 
     pipeline = loaded_pipeline_config['pipeline']
     if pipeline is None or pipeline.model_version != model_version:
         print(f'Switching model to {model_version}')
-        del pipeline
-        del loaded_pipeline_config['pipeline']
-        gc.collect()
-        torch.cuda.empty_cache()
+        if pipeline is not None:  # Check if pipeline exists before deleting
+            del pipeline
+            del loaded_pipeline_config['pipeline']
+            gc.collect()
+            torch.cuda.empty_cache()
 
         model_path = f'./models/InfiniteYou/infu_flux_v1.0/{model_version}'
         print(f'Loading model from {model_path}')
@@ -89,6 +114,8 @@ def prepare_pipeline(model_version, enable_realism, enable_anti_blur):
             image_proj_num_tokens=8,
             infu_flux_version='v1.0',
             model_version=model_version,
+            quantize_8bit=quantize_8bit,
+            cpu_offload=cpu_offload,
         )
 
         loaded_pipeline_config['pipeline'] = pipeline
@@ -102,7 +129,6 @@ def prepare_pipeline(model_version, enable_realism, enable_anti_blur):
     pipeline.load_loras(loras)
 
     return pipeline
-
 
 def generate_image(
     input_image, 
@@ -118,9 +144,21 @@ def generate_image(
     infusenet_guidance_end,
     enable_realism,
     enable_anti_blur,
+    quantize_8bit,
+    cpu_offload,
     model_version
 ):
-    pipeline = prepare_pipeline(model_version=model_version, enable_realism=enable_realism, enable_anti_blur=enable_anti_blur)
+    # Download models if not already done
+    download_models()
+
+    # Prepare pipeline with user-selected options
+    pipeline = prepare_pipeline(
+        model_version=model_version,
+        enable_realism=enable_realism,
+        enable_anti_blur=enable_anti_blur,
+        quantize_8bit=quantize_8bit,
+        cpu_offload=cpu_offload
+    )
 
     if seed == 0:
         seed = torch.seed() & 0xFFFFFFFF
@@ -138,18 +176,27 @@ def generate_image(
             infusenet_conditioning_scale=infusenet_conditioning_scale,
             infusenet_guidance_start=infusenet_guidance_start,
             infusenet_guidance_end=infusenet_guidance_end,
+            cpu_offload=cpu_offload,
         )
+        # Save the generated image
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        index = len(os.listdir(OUTPUT_DIR))
+        prompt_name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in prompt[:50].replace(' ', '_')).strip('_')
+        out_name = f"{index:05d}_{prompt_name}_seed{seed}.png"
+        out_path = os.path.join(OUTPUT_DIR, out_name)
+        image.save(out_path)
+        return gr.update(value=image, label=f"Generated Image, seed={seed}, saved to {out_path}"), str(seed)
     except Exception as e:
         print(e)
         gr.Error(f"An error occurred: {e}")
-        return gr.update()
-
-    return gr.update(value = image, label=f"Generated Image, seed = {seed}")
-
+        return gr.update(), str(seed)
 
 def generate_examples(id_image, control_image, prompt_text, seed, enable_realism, enable_anti_blur, model_version):
-    return generate_image(id_image, control_image, prompt_text, seed, 864, 1152, 3.5, 30, 1.0, 0.0, 1.0, enable_realism, enable_anti_blur, model_version)
-
+    # Use default values for quantize_8bit and cpu_offload for examples
+    return generate_image(
+        id_image, control_image, prompt_text, seed, 864, 1152, 3.5, 30, 1.0, 0.0, 1.0,
+        enable_realism, enable_anti_blur, QUANTIZE_8BIT_DEFAULT, CPU_OFFLOAD_DEFAULT, model_version
+    )
 
 sample_list = [
     ['./assets/examples/man.jpg', None, 'A sophisticated gentleman exuding confidence. He is dressed in a 1990s brown plaid jacket with a high collar, paired with a dark grey turtleneck. His trousers are tailored and charcoal in color, complemented by a sleek leather belt. The background showcases an elegant library with bookshelves, a marble fireplace, and warm lighting, creating a refined and cozy atmosphere. His relaxed posture and casual hand-in-pocket stance add to his composed and stylish demeanor', 666, False, False, 'aes_stage2'],
@@ -169,9 +216,9 @@ with gr.Blocks() as demo:
     <div style="text-align: center; max-width: 900px; margin: 0 auto;">
         <h1 style="font-size: 1.5rem; font-weight: 700; display: block;">InfiniteYou-FLUX</h1>
         <h2 style="font-size: 1.2rem; font-weight: 300; margin-bottom: 1rem; display: block;">Official Gradio Demo for <a href="https://arxiv.org/abs/2503.16418">InfiniteYou: Flexible Photo Recrafting While Preserving Your Identity</a></h2>
-        <a href="https://bytedance.github.io/InfiniteYou">[Project Page]</a>&ensp;
-        <a href="https://arxiv.org/abs/2503.16418">[Paper]</a>&ensp;
-        <a href="https://github.com/bytedance/InfiniteYou">[Code]</a>&ensp;
+        <a href="https://bytedance.github.io/InfiniteYou">[Project Page]</a> 
+        <a href="https://arxiv.org/abs/2503.16418">[Paper]</a> 
+        <a href="https://github.com/bytedance/InfiniteYou">[Code]</a> 
         <a href="https://huggingface.co/ByteDance/InfiniteYou">[Model]</a>
     </div>
     """)
@@ -206,6 +253,8 @@ with gr.Blocks() as demo:
                     ui_num_steps = gr.Number(label="num steps", value=30)
                     ui_seed = gr.Number(label="seed (0 for random)", value=0)
                 with gr.Row():
+                    ui_last_seed = gr.Textbox(label="Last Seed Used", value="", interactive=False)
+                with gr.Row():
                     ui_width = gr.Number(label="width", value=864)
                     ui_height = gr.Number(label="height", value=1152)
                 ui_guidance_scale = gr.Number(label="guidance scale", value=3.5, step=0.5)
@@ -213,6 +262,9 @@ with gr.Blocks() as demo:
                 with gr.Row():
                     ui_infusenet_guidance_start = gr.Slider(minimum=0.0, maximum=1.0, value=0.0, step=0.05, label="infusenet guidance start")
                     ui_infusenet_guidance_end = gr.Slider(minimum=0.0, maximum=1.0, value=1.0, step=0.05, label="infusenet guidance end")
+                with gr.Row():
+                    ui_quantize_8bit = gr.Checkbox(label="Enable 8-bit quantization", value=True)
+                    ui_cpu_offload = gr.Checkbox(label="Enable CPU offloading", value=True)
 
             with gr.Accordion("LoRAs [Optional]", open=True):
                 with gr.Row():
@@ -228,15 +280,18 @@ with gr.Blocks() as demo:
                 - **Useful Hyperparameters**: Usually, there is NO need to adjust too much. If necessary, try a slightly larger `--infusenet_guidance_start` (*e.g.*, `0.1`) only (especially helpful for `sim_stage1`). If still not satisfactory, then try a slightly smaller `--infusenet_conditioning_scale` (*e.g.*, `0.9`).
                 - **Optional LoRAs**: `realism` and `anti-blur`. To enable them, please check the corresponding boxes. If needed, try `realism` only first. They are optional and were NOT used in our paper.
                 - **Gender Prompt**: If the generated gender is not preferred, add specific words in the prompt, such as 'a man', 'a woman', *etc*. We encourage using inclusive and respectful language.
+                - **Performance Options**: Enable `8-bit quantization` to reduce memory usage and `CPU offloading` to use CPU memory for parts of the model, which can help on systems with limited GPU memory.
+                - **Automatic Saving**: Generated images are automatically saved to the `./results` folder with filenames like `index_prompt_seed.png`.
+                - **Reusing Seeds**: The "Last Seed Used" field shows the seed from the most recent generation. Copy it to the "seed" input to reuse it.
                 """
             )
 
     gr.Examples(
         sample_list,
         inputs=[ui_id_image, ui_control_image, ui_prompt_text, ui_seed, ui_enable_realism, ui_enable_anti_blur, ui_model_version],
-        outputs=[image_output],
+        outputs=[image_output, ui_last_seed],
         fn=generate_examples,
-        cache_examples=True,
+        cache_examples=False,
     )
 
     ui_btn_generate.click(
@@ -251,13 +306,15 @@ with gr.Blocks() as demo:
             ui_guidance_scale, 
             ui_num_steps, 
             ui_infusenet_conditioning_scale, 
-            ui_infusenet_guidance_start, 
+            ui_infusenet_guidance_start,
             ui_infusenet_guidance_end,
             ui_enable_realism,
             ui_enable_anti_blur,
+            ui_quantize_8bit,
+            ui_cpu_offload,
             ui_model_version
         ], 
-        outputs=[image_output], 
+        outputs=[image_output, ui_last_seed], 
         concurrency_id="gpu"
     )
 
@@ -270,7 +327,7 @@ with gr.Blocks() as demo:
         """
         ---
         ### 📜 Disclaimer and Licenses 
-        The images used in this demo are sourced from consented subjects or generated by the models. These pictures are intended solely to show the capabilities of our research. If you have any concerns, please contact us, and we will promptly remove any inappropriate content.
+        The images used in this demo are sourced from consented subjects or generated by the models. These pictures are intended solely to show the capabilities of our research. If you have any concerns, please contact us, and we will promptly remove any appropriate content.
         
         The use of the released code, model, and demo must strictly adhere to the respective licenses. 
         Our code is released under the [Apache 2.0 License](https://github.com/bytedance/InfiniteYou/blob/main/LICENSE), 
@@ -302,10 +359,6 @@ with gr.Blocks() as demo:
         """
     )
 
-download_models()
-
-prepare_pipeline(model_version=ModelVersion.DEFAULT_VERSION, enable_realism=ENABLE_REALISM_DEFAULT, enable_anti_blur=ENABLE_ANTI_BLUR_DEFAULT)
-
 demo.queue()
-demo.launch(server_name='0.0.0.0')  # IPv4
+demo.launch(server_name='0.0.0.0', share=True)  # IPv4
 # demo.launch(server_name='[::]')  # IPv6
