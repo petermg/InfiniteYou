@@ -260,10 +260,10 @@ def convert_lora_state_to_loras(lora_state):
     return loras
 
 def list_lora_files(directory):
-    """Scan the directory for .safetensors files and return their filenames and full paths."""
+    """Scan the specified directory for .safetensors files and return their filenames and full paths."""
     logger.info(f"Listing LoRA files in directory: {directory}")
-    if not directory or not isinstance(directory, str) or not os.path.isdir(directory):
-        logger.warning(f"Invalid or non-existent directory: {directory}")
+    if not directory:
+        logger.warning("No LoRA directory specified, returning empty list")
         return []
     try:
         safetensors_files = glob.glob(os.path.join(directory, "*.safetensors"))
@@ -285,10 +285,11 @@ def update_lora_fields(lora_list):
     for i in range(MAX_LORA_FIELDS):
         if i < len(lora_list):
             lora = lora_list[i]
-            name = lora["name"].split('_')[0] if '_' in lora["name"] and lora["name"] != "None" else lora["name"]
-            if name not in valid_choices and not lora["path"]:
-                logger.warning(f"Invalid LoRA name {name} in lora_list at index {i}, defaulting to 'None'")
-                name = "None"
+            # For custom LoRAs, display the original filename; for built-in, use the name
+            display_name = lora["name"].split('_')[0] if lora["name"] != "None" and '_' in lora["name"] else lora["name"]
+            if display_name not in valid_choices and not lora["path"]:
+                logger.warning(f"Invalid LoRA name {display_name} in lora_list at index {i}, defaulting to 'None'")
+                display_name = "None"
             path = lora["path"]
             try:
                 weight = float(lora["weight"])
@@ -297,13 +298,13 @@ def update_lora_fields(lora_list):
                 weight = 1.5
             visible = True
         else:
-            name = "None"
+            display_name = "None"
             path = ""
             weight = 1.5
             visible = False
         updates.extend([
-            gr.update(value=name, visible=visible),  # lora_name (dropdown)
-            gr.update(value=path, visible=visible and name not in valid_choices),  # lora_path (textbox)
+            gr.update(value=display_name, visible=visible),  # lora_name (dropdown)
+            gr.update(value=path, visible=visible and display_name not in valid_choices),  # lora_path (textbox)
             gr.update(value=weight, visible=visible),  # lora_weight
             gr.update(visible=visible),  # remove_btn
             gr.update(visible=visible),  # row
@@ -503,10 +504,7 @@ with gr.Blocks() as demo:
             with gr.Accordion("LoRAs [Optional]", open=True) as lora_accordion:
                 lora_components = []
                 with gr.Column():
-                    lora_dir = gr.Textbox(
-                        label="LoRA Directory (e.g., C:\\AI\\AIModels\\Flux)",
-                        value=""
-                    )
+                    lora_dir = gr.Textbox(label="LoRA Directory", value="./loras")
                     list_lora_btn = gr.Button("List LoRAs")
                     custom_lora_select = gr.Dropdown(
                         label="Select Custom LoRA",
@@ -627,7 +625,7 @@ with gr.Blocks() as demo:
                 ### ❗️ Important Usage Tips:
                 - **Model Version**: `aes_stage2` is used by default for better text-image alignment and aesthetics. For higher ID similarity, try `sim_stage1`.
                 - **Useful Hyperparameters**: Usually, there is NO need to adjust too much. If necessary, try a slightly larger `--infusenet_guidance_start` (*e.g.*, `0.1`) only (especially helpful for `sim_stage1`). If still not satisfactory, then try a slightly smaller `--infusenet_conditioning_scale` (*e.g.*, `0.9`).
-                - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, enter a directory path (e.g., `C:\\AI\\AIModels\\Flux`) in "LoRA Directory" and click "List LoRAs" to populate the "Select Custom LoRA" dropdown with .safetensors files. Select a custom LoRA to apply it to the current LoRA field, and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRAs are optional and were NOT used in our paper unless specified.
+                - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, specify a directory containing .safetensors files (defaults to `./loras`) and click "List LoRAs". LoRAs are automatically loaded from `./loras` on startup. Select a custom LoRA from the "Select Custom LoRA" dropdown to apply it to the current LoRA field, and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRAs are optional and were NOT used in our paper unless specified.
                 - **Gender Prompt**: If the generated gender is not preferred, add specific words in the prompt, such as 'a man', 'a woman', *etc*. We encourage using inclusive and respectful language.
                 - **Performance Options**: Enable `8-bit quantization` to reduce memory usage and `CPU offloading` to use CPU memory for parts of the model, which can help on systems with limited GPU memory.
                 - **Automatic Saving**: Generated images are automatically saved to the `./results` folder with filenames like `index_prompt_seed.png`.
@@ -664,6 +662,18 @@ with gr.Blocks() as demo:
         ], 
         outputs=[image_output, ui_last_seed], 
         concurrency_id="gpu"
+    )
+
+    demo.load(
+        fn=list_lora_files,
+        inputs=[lora_dir],
+        outputs=[custom_loras],
+        queue=False
+    ).then(
+        fn=lambda cl: gr.update(choices=[name for name, _ in cl], value=None),
+        inputs=[custom_loras],
+        outputs=[custom_lora_select],
+        queue=False
     )
 
     with gr.Accordion("Local Gradio Demo for Developers", open=False):
