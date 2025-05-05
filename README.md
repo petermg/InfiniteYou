@@ -1,5 +1,10 @@
 <div align="center">
+  
+# This fork is modified to support custom LoRAs.
 
+![image](https://github.com/user-attachments/assets/46e5b0e0-635b-43b3-a64d-4a013dbc95a5)
+
+  
 ## InfiniteYou: Flexible Photo Recrafting While Preserving Your Identity
 
 [**Liming Jiang**](https://liming-jiang.com/)&nbsp;&nbsp;&nbsp;&nbsp;
