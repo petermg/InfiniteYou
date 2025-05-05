@@ -31,7 +31,10 @@ from transformers import T5EncoderModel
 
 from .pipeline_flux_infusenet import FluxInfuseNetPipeline
 from .resampler import Resampler
+import logging
 
+# Set up logging
+logger = logging.getLogger(__name__)
 
 def seed_everything(seed, deterministic=False):
     """Set random seed.
@@ -218,16 +221,24 @@ class InfUFluxPipeline:
         self.arcface_model = init_recognition_model('arcface', device='cuda')
 
     def load_loras(self, loras):
-        names, scales = [],[]
+        names, scales = [], []
         for lora_path, lora_name, lora_scale in loras:
             if lora_path != "":
-                print(f"Loading lora {lora_path}")
-                self.pipe.load_lora_weights(lora_path, adapter_name = lora_name)
-                names.append(lora_name)
-                scales.append(lora_scale)
-
+                logger.info(f"Loading LoRA: path={lora_path}, name={lora_name}, scale={lora_scale}")
+                try:
+                    self.pipe.load_lora_weights(lora_path, adapter_name=lora_name)
+                    names.append(lora_name)
+                    scales.append(lora_scale)
+                except Exception as e:
+                    logger.error(f"Failed to load LoRA {lora_name} from {lora_path}: {e}")
+                    raise RuntimeError(f"Failed to load LoRA {lora_name}: {e}")
         if len(names) > 0:
-            self.pipe.set_adapters(names, adapter_weights=scales)
+            try:
+                self.pipe.set_adapters(names, adapter_weights=scales)
+                logger.info(f"Activated LoRA adapters: names={names}, weights={scales}")
+            except Exception as e:
+                logger.error(f"Failed to set LoRA adapters {names}: {e}")
+                raise RuntimeError(f"Failed to set LoRA adapters: {e}")
 
     def _detect_face(self, id_image_cv2):
         face_info = self.app_640.get(id_image_cv2)
@@ -257,7 +268,7 @@ class InfUFluxPipeline:
         cpu_offload = False,
     ):        
         # Extract ID embeddings
-        print('Preparing ID embeddings')
+        logger.info('Preparing ID embeddings')
         id_image_cv2 = cv2.cvtColor(np.array(id_image), cv2.COLOR_RGB2BGR)
         face_info = self._detect_face(id_image_cv2)
         if len(face_info) == 0:
@@ -283,7 +294,7 @@ class InfUFluxPipeline:
         torch.cuda.empty_cache()
         
         # Load control image
-        print('Preparing the control image')
+        logger.info('Preparing the control image')
         if control_image is not None:
             control_image = control_image.convert("RGB")
             control_image = resize_and_pad_image(control_image, (width, height))
@@ -297,7 +308,7 @@ class InfUFluxPipeline:
             control_image = Image.fromarray(out_img.astype(np.uint8))
 
         # Perform inference
-        print('Generating image')
+        logger.info('Generating image')
         seed_everything(seed)
         image = self.pipe(
             prompt=prompt,
