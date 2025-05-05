@@ -34,6 +34,7 @@ from .resampler import Resampler
 import logging
 
 # Set up logging
+logging.basicConfig(level=logging.DEBUG, filename='pipeline.log', filemode='a')
 logger = logging.getLogger(__name__)
 
 def seed_everything(seed, deterministic=False):
@@ -55,7 +56,6 @@ def seed_everything(seed, deterministic=False):
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
 
 # modified from https://github.com/instantX-research/InstantID/blob/main/pipeline_stable_diffusion_xl_instantid.py
 def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255)]):
@@ -86,7 +86,6 @@ def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,2
     out_img_pil = Image.fromarray(out_img.astype(np.uint8))
     return out_img_pil
 
-
 def extract_arcface_bgr_embedding(in_image, landmark, arcface_model=None, in_settings=None):
     kps = landmark
     arc_face_image = face_align.norm_crop(in_image, landmark=np.array(kps), image_size=112)
@@ -97,7 +96,6 @@ def extract_arcface_bgr_embedding(in_image, landmark, arcface_model=None, in_set
         arcface_model = init_recognition_model('arcface', device='cuda')
     face_emb = arcface_model(arc_face_image)[0] # [512], normalized
     return face_emb
-
 
 def resize_and_pad_image(source_img, target_img_size):
     # Get original and target sizes
@@ -124,7 +122,6 @@ def resize_and_pad_image(source_img, target_img_size):
     padded_img.paste(resized_source_img, (pad_left, pad_top))
     
     return padded_img
-
 
 class InfUFluxPipeline:
     def __init__(
@@ -221,24 +218,48 @@ class InfUFluxPipeline:
         self.arcface_model = init_recognition_model('arcface', device='cuda')
 
     def load_loras(self, loras):
+        """
+        Load and apply LoRA weights to the model.
+        Args:
+            loras: List of [lora_path, lora_name, lora_scale] for each LoRA.
+        """
+        logger.info(f"Loading LoRAs for model_version={self.model_version}: {loras}")
+        
+        # Unload existing LoRA weights to prevent state issues
+        try:
+            self.pipe.unload_lora_weights()
+            logger.info("Unloaded existing LoRA weights")
+        except Exception as e:
+            logger.warning(f"Failed to unload LoRA weights: {e}")
+
         names, scales = [], []
         for lora_path, lora_name, lora_scale in loras:
             if lora_path != "":
+                print(f"Loading lora {lora_path}")
                 logger.info(f"Loading LoRA: path={lora_path}, name={lora_name}, scale={lora_scale}")
                 try:
                     self.pipe.load_lora_weights(lora_path, adapter_name=lora_name)
                     names.append(lora_name)
                     scales.append(lora_scale)
+                    logger.debug(f"Loaded LoRA weights for {lora_name}")
                 except Exception as e:
                     logger.error(f"Failed to load LoRA {lora_name} from {lora_path}: {e}")
                     raise RuntimeError(f"Failed to load LoRA {lora_name}: {e}")
+        
         if len(names) > 0:
             try:
+                # Disable adapters to ensure clean state
+                self.pipe.disable_lora()
+                logger.debug("Disabled existing LoRA adapters")
+                # Set and enable new adapters
                 self.pipe.set_adapters(names, adapter_weights=scales)
+                self.pipe.enable_lora()
                 logger.info(f"Activated LoRA adapters: names={names}, weights={scales}")
             except Exception as e:
                 logger.error(f"Failed to set LoRA adapters {names}: {e}")
                 raise RuntimeError(f"Failed to set LoRA adapters: {e}")
+        else:
+            logger.info("No LoRAs provided, using base model")
 
     def _detect_face(self, id_image_cv2):
         face_info = self.app_640.get(id_image_cv2)
