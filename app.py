@@ -18,12 +18,14 @@ import os
 import logging
 import glob
 import re
+import json
 
 import gradio as gr
 import pillow_avif
 import torch
 from huggingface_hub import snapshot_download
 from pillow_heif import register_heif_opener
+from safetensors.torch import load_file
 
 from pipelines.pipeline_infu_flux import InfUFluxPipeline
 
@@ -259,17 +261,92 @@ def convert_lora_state_to_loras(lora_state):
     logger.debug(f"Converted lora_state: {lora_state} to loras: {loras}")
     return loras
 
+def read_safetensors_header(file_path):
+    """Read the header of a safetensors file and attempt to parse JSON metadata."""
+    try:
+        with open(file_path, 'rb') as f:
+            # Read the first 8 bytes to get the header length
+            header_len_bytes = f.read(8)
+            if len(header_len_bytes) != 8:
+                logger.warning(f"Failed to read header length from {file_path}")
+                return {}
+            header_len = int.from_bytes(header_len_bytes, byteorder='little')
+            # Read the header data
+            header_data = f.read(header_len)
+            if len(header_data) != header_len:
+                logger.warning(f"Incomplete header read from {file_path}: expected {header_len}, got {len(header_data)}")
+                return {}
+            # Try decoding as UTF-8, replacing invalid characters
+            try:
+                header_str = header_data.decode('utf-8')
+            except UnicodeDecodeError:
+                header_str = header_data.decode('utf-8', errors='replace')
+            logger.debug(f"Raw header from {file_path}: {header_str[:1000]}...")
+            # Parse JSON
+            try:
+                header_json = json.loads(header_str)
+                metadata = header_json.get("__metadata__", {})
+                if not isinstance(metadata, dict):
+                    logger.warning(f"Metadata in {file_path} is not a dictionary: {metadata}")
+                    metadata = {"raw_metadata": str(metadata)}
+                metadata = {k: str(v) for k, v in metadata.items()}
+                logger.info(f"Parsed metadata from header in {file_path}: {metadata}")
+                return metadata
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse JSON header in {file_path}: {e}")
+                return {}
+    except Exception as e:
+        logger.error(f"Error reading safetensors header from {file_path}: {e}")
+        return {}
+
 def list_lora_files(directory):
-    """Scan the specified directory for .safetensors files and return their filenames and full paths."""
+    """Scan the specified directory for .safetensors files and return their filenames, full paths, and metadata."""
     logger.info(f"Listing LoRA files in directory: {directory}")
     if not directory:
         logger.warning("No LoRA directory specified, returning empty list")
         return []
     try:
         safetensors_files = glob.glob(os.path.join(directory, "*.safetensors"))
-        # Return list of [filename, full_path] pairs
-        lora_list = [[os.path.basename(f), f] for f in safetensors_files]
-        logger.info(f"Found LoRA files: {lora_list}")
+        lora_list = []
+        for f in safetensors_files:
+            try:
+                # First attempt to load metadata using safetensors.torch
+                safetensors_data = load_file(f, device="cpu")
+                file_keys = list(safetensors_data.keys())
+                logger.debug(f"Keys in {f}: {file_keys}")
+                
+                # Try standard __metadata__ key
+                metadata = safetensors_data.get("__metadata__", {})
+                if not metadata:
+                    # Check for alternative metadata keys
+                    for key in file_keys:
+                        if "metadata" in key.lower() or "info" in key.lower():
+                            try:
+                                metadata = safetensors_data[key]
+                                if isinstance(metadata, str):
+                                    metadata = json.loads(metadata)
+                                logger.debug(f"Found metadata in key {key}: {metadata}")
+                                break
+                            except Exception as e:
+                                logger.warning(f"Failed to parse metadata from key {key} in {f}: {e}")
+                
+                # If no metadata found, try reading the header directly
+                if not metadata:
+                    logger.info(f"No metadata found via load_file for {f}, attempting header read")
+                    metadata = read_safetensors_header(f)
+                
+                # Ensure metadata is a dictionary and serializable
+                if not isinstance(metadata, dict):
+                    logger.warning(f"Metadata in {f} is not a dictionary: {metadata}")
+                    metadata = {"raw_metadata": str(metadata)}
+                metadata = {k: str(v) for k, v in metadata.items()}
+                
+                logger.info(f"Metadata for {f}: {metadata}")
+                lora_list.append([os.path.basename(f), f, metadata])
+            except Exception as e:
+                logger.warning(f"Failed to load metadata for {f}: {e}")
+                lora_list.append([os.path.basename(f), f, {}])
+        logger.info(f"Found LoRA files with metadata: {lora_list}")
         return lora_list
     except Exception as e:
         logger.error(f"Error listing LoRA files in {directory}: {e}")
@@ -281,11 +358,10 @@ def update_lora_fields(lora_list):
     valid_choices = ["None"] + list(AVAILABLE_LORAS.keys())
     # Ensure at least one LoRA field is visible
     if not lora_list:
-        lora_list = [{"name": "None", "path": "", "weight": 1.5}]
+        lora_list = [{"name": "None", "path": "", "weight": 1.5, "metadata": {}}]
     for i in range(MAX_LORA_FIELDS):
         if i < len(lora_list):
             lora = lora_list[i]
-            # For custom LoRAs, display the original filename; for built-in, use the name
             display_name = lora["name"].split('_')[0] if lora["name"] != "None" and '_' in lora["name"] else lora["name"]
             if display_name not in valid_choices and not lora["path"]:
                 logger.warning(f"Invalid LoRA name {display_name} in lora_list at index {i}, defaulting to 'None'")
@@ -296,16 +372,20 @@ def update_lora_fields(lora_list):
             except (ValueError, TypeError):
                 logger.warning(f"Invalid weight {lora['weight']} for LoRA {lora['name']}, defaulting to 1.5")
                 weight = 1.5
+            metadata = lora.get("metadata", {})
+            metadata_display = "\n".join([f"{k}: {v}" for k, v in metadata.items()]) if metadata else "No metadata available"
             visible = True
         else:
             display_name = "None"
             path = ""
             weight = 1.5
+            metadata_display = "No metadata available"
             visible = False
         updates.extend([
             gr.update(value=display_name, visible=visible),  # lora_name (dropdown)
             gr.update(value=path, visible=visible and display_name not in valid_choices),  # lora_path (textbox)
             gr.update(value=weight, visible=visible),  # lora_weight
+            gr.update(value=metadata_display, visible=visible),  # lora_metadata
             gr.update(visible=visible),  # remove_btn
             gr.update(visible=visible),  # row
         ])
@@ -314,7 +394,7 @@ def update_lora_fields(lora_list):
 
 def add_lora(lora_list):
     if len(lora_list) < MAX_LORA_FIELDS:
-        new_list = lora_list + [{"name": "None", "path": "", "weight": 1.5}]
+        new_list = lora_list + [{"name": "None", "path": "", "weight": 1.5, "metadata": {}}]
         logger.info(f"Added new LoRA. New lora_list: {new_list}")
         return new_list
     logger.info("Maximum LoRA fields reached.")
@@ -333,23 +413,22 @@ def sanitize_lora_name(name):
     """Remove invalid characters from LoRA name to make it a valid PyTorch module name."""
     if not name or name == "None":
         return name
-    # Remove .safetensors and any invalid characters, replace with underscores
     clean_name = re.sub(r'\.safetensors$', '', name)
     clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', clean_name)
-    # Ensure name doesn't start with a digit
     if clean_name and clean_name[0].isdigit():
         clean_name = f"lora_{clean_name}"
     logger.debug(f"Sanitized LoRA name: {name} -> {clean_name}")
     return clean_name
 
-def update_lora(index, name, path, weight, lora_list):
+def update_lora(index, name, path, weight, lora_list, metadata=None):
     """Update a single LoRA entry in lora_list."""
-    logger.debug(f"update_lora called with index={index}, name={name}, path={path}, weight={weight}, lora_list={lora_list}")
+    logger.debug(f"update_lora called with index={index}, name={name}, path={path}, weight={weight}, lora_list={lora_list}, metadata={metadata}")
     valid_choices = ["None"] + list(AVAILABLE_LORAS.keys())
     if name not in valid_choices and not path:
         logger.warning(f"Invalid LoRA name '{name}' at index {index}, defaulting to 'None'")
         name = "None"
         path = ""
+        metadata = {}
     try:
         weight = float(weight)
     except (ValueError, TypeError):
@@ -359,17 +438,41 @@ def update_lora(index, name, path, weight, lora_list):
         logger.warning(f"Invalid LoRA path '{path}' at index {index}, defaulting to 'None'")
         name = "None"
         path = ""
+        metadata = {}
     elif name in AVAILABLE_LORAS:
         path = AVAILABLE_LORAS[name]
+        try:
+            safetensors_data = load_file(path, device="cpu")
+            file_keys = list(safetensors_data.keys())
+            logger.debug(f"Keys in built-in LoRA {path}: {file_keys}")
+            metadata = safetensors_data.get("__metadata__", {})
+            if not metadata:
+                for key in file_keys:
+                    if "metadata" in key.lower() or "info" in key.lower():
+                        try:
+                            metadata = safetensors_data[key]
+                            if isinstance(metadata, str):
+                                metadata = json.loads(metadata)
+                            logger.debug(f"Found metadata in key {key} for {path}: {metadata}")
+                            break
+                        except Exception as e:
+                            logger.warning(f"Failed to parse metadata from key {key} in {path}: {e}")
+                if not metadata:
+                    logger.info(f"No metadata found via load_file for {path}, attempting header read")
+                    metadata = read_safetensors_header(path)
+            metadata = {k: str(v) for k, v in metadata.items()}
+            logger.info(f"Metadata for built-in LoRA {path}: {metadata}")
+        except Exception as e:
+            logger.warning(f"Failed to load metadata for built-in LoRA {path}: {e}")
+            metadata = {}
 
     new_list = lora_list.copy()
     if index >= len(new_list):
-        new_list.append({"name": "None", "path": "", "weight": 1.5})
+        new_list.append({"name": "None", "path": "", "weight": 1.5, "metadata": {}})
 
-    # Sanitize the name for PyTorch module compatibility
     sanitized_name = sanitize_lora_name(name)
     unique_name = f"{sanitized_name}_{index}" if sanitized_name != "None" else "None"
-    new_list[index] = {"name": unique_name, "path": path, "weight": weight}
+    new_list[index] = {"name": unique_name, "path": path, "weight": weight, "metadata": metadata or {}}
     
     logger.info(f"Updated lora_list: {new_list}")
     return new_list
@@ -384,7 +487,33 @@ def update_lora_name(index, name, lora_list):
         return lora_list
     weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
     path = AVAILABLE_LORAS.get(name, "")
-    return update_lora(index, name, path, weight, lora_list)
+    metadata = {}
+    if path:
+        try:
+            safetensors_data = load_file(path, device="cpu")
+            file_keys = list(safetensors_data.keys())
+            logger.debug(f"Keys in {path}: {file_keys}")
+            metadata = safetensors_data.get("__metadata__", {})
+            if not metadata:
+                for key in file_keys:
+                    if "metadata" in key.lower() or "info" in key.lower():
+                        try:
+                            metadata = safetensors_data[key]
+                            if isinstance(metadata, str):
+                                metadata = json.loads(metadata)
+                            logger.debug(f"Found metadata in key {key}: {metadata}")
+                            break
+                        except Exception as e:
+                            logger.warning(f"Failed to parse metadata from key {key} in {path}: {e}")
+                if not metadata:
+                    logger.info(f"No metadata found via load_file for {path}, attempting header read")
+                    metadata = read_safetensors_header(path)
+            metadata = {k: str(v) for k, v in metadata.items()}
+            logger.info(f"Metadata for {path}: {metadata}")
+        except Exception as e:
+            logger.warning(f"Failed to load metadata for {path}: {e}")
+            metadata = {}
+    return update_lora(index, name, path, weight, lora_list, metadata)
 
 def select_custom_lora(index, lora_name, lora_list, custom_loras):
     """Update lora_state with the selected custom LoRA."""
@@ -394,13 +523,15 @@ def select_custom_lora(index, lora_name, lora_list, custom_loras):
     current_lora = lora_list[index]
     weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
     path = ""
+    metadata = {}
     if lora_name:
-        for name, full_path in custom_loras:
+        for name, full_path, meta in custom_loras:
             if name == lora_name:
                 path = full_path
+                metadata = meta
                 break
     name = lora_name if path else "None"
-    return update_lora(index, name, path, weight, lora_list)
+    return update_lora(index, name, path, weight, lora_list, metadata)
 
 def update_lora_path(index, path, lora_list):
     """Update LoRA path manually entered by user."""
@@ -410,42 +541,70 @@ def update_lora_path(index, path, lora_list):
     current_lora = lora_list[index]
     name = os.path.basename(path) if path and isinstance(path, str) and path.endswith('.safetensors') else "None"
     weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
-    path = path if path and isinstance(path, str) and path.endswith('.safetensors') else ""
+    metadata = {}
+    if path and isinstance(path, str) and path.endswith('.safetensors'):
+        try:
+            safetensors_data = load_file(path, device="cpu")
+            file_keys = list(safetensors_data.keys())
+            logger.debug(f"Keys in {path}: {file_keys}")
+            metadata = safetensors_data.get("__metadata__", {})
+            if not metadata:
+                for key in file_keys:
+                    if "metadata" in key.lower() or "info" in key.lower():
+                        try:
+                            metadata = safetensors_data[key]
+                            if isinstance(metadata, str):
+                                metadata = json.loads(metadata)
+                            logger.debug(f"Found metadata in key {key}: {metadata}")
+                            break
+                        except Exception as e:
+                            logger.warning(f"Failed to parse metadata from key {key} in {path}: {e}")
+                if not metadata:
+                    logger.info(f"No metadata found via load_file for {path}, attempting header read")
+                    metadata = read_safetensors_header(path)
+            metadata = {k: str(v) for k, v in metadata.items()}
+            logger.info(f"Metadata for {path}: {metadata}")
+        except Exception as e:
+            logger.warning(f"Failed to load metadata for {path}: {e}")
+            metadata = {}
+    else:
+        path = ""
     if current_lora["path"] == path:
         return lora_list
-    return update_lora(index, name, path, weight, lora_list)
+    return update_lora(index, name, path, weight, lora_list, metadata)
 
 def update_lora_weight(index, weight, lora_list):
-    """Update LoRA weight, preserving name and path."""
+    """Update LoRA weight, preserving name, path, and metadata."""
     logger.debug(f"update_lora_weight called with index={index}, weight={weight}, lora_list={lora_list}")
     if index >= len(lora_list):
         return lora_list
     current_lora = lora_list[index]
     name = current_lora["name"].split('_')[0] if '_' in current_lora["name"] else current_lora["name"]
     path = current_lora["path"]
+    metadata = current_lora.get("metadata", {})
     try:
         weight = float(weight)
     except (ValueError, TypeError):
         weight = 1.5
     if current_lora["weight"] == weight:
         return lora_list
-    return update_lora(index, name, path, weight, lora_list)
+    return update_lora(index, name, path, weight, lora_list, metadata)
 
 sample_list = [
     ['./assets/examples/man.jpg', None, 'A sophisticated gentleman exuding confidence. He is dressed in a 1990s brown plaid jacket with a high collar, paired with a dark grey turtleneck. His trousers are tailored and charcoal in color, complemented by a sleek leather belt. The background showcases an elegant library with bookshelves, a marble fireplace, and warm lighting, creating a refined and cozy atmosphere. His relaxed posture and casual hand-in-pocket stance add to his composed and stylish demeanor', 666, [], 'aes_stage2'],
-    ['./assets/examples/man.jpg', './assets/examples/man_pose.jpg', 'A man, portrait, cinematic', 42, [{"name": "realism_1", "path": AVAILABLE_LORAS["realism"], "weight": 1.5}], 'aes_stage2'],
+    ['./assets/examples/man.jpg', './assets/examples/man_pose.jpg', 'A man, portrait, cinematic', 42, [{"name": "realism_1", "path": AVAILABLE_LORAS["realism"], "weight": 1.5, "metadata": {}}], 'aes_stage2'],
     ['./assets/examples/man.jpg', None, 'A man, portrait, cinematic', 12345, [], 'sim_stage1'],
     ['./assets/examples/woman.jpg', './assets/examples/woman.jpg', 'A woman, portrait, cinematic', 1621695706, [], 'sim_stage1'],
     ['./assets/examples/woman.jpg', None, 'A young woman holding a sign with the text "InfiniteYou", "Infinite" in black and "You" in red, pure background', 3724009365, [], 'aes_stage2'],
-    ['./assets/examples/woman.jpg', None, 'A photo of an elegant Javanese bride in traditional attire, with long hair styled into intricate a braid made of many fresh flowers, wearing a delicate headdress made from sequins and beads. She\'s holding flowers, light smiling at the camera, against a backdrop adorned with orchid blooms. The scene captures her grace as she stands amidst soft pastel colors, adding to its dreamy atmosphere', 42, [{"name": "realism_1", "path": AVAILABLE_LORAS["realism"], "weight": 1.5}], 'aes_stage2'],
+    ['./assets/examples/woman.jpg', None, 'A photo of an elegant Javanese bride in traditional attire, with long hair styled into intricate a braid made of many fresh flowers, wearing a delicate headdress made from sequins and beads. She\'s holding flowers, light smiling at the camera, against a backdrop adorned with orchid blooms. The scene captures her grace as she stands amidst soft pastel colors, adding to its dreamy atmosphere', 42, [{"name": "realism_1", "path": AVAILABLE_LORAS["realism"], "weight": 1.5, "metadata": {}}], 'aes_stage2'],
     ['./assets/examples/woman.jpg', None, 'A photo of an elegant Javanese bride in traditional attire, with long hair styled into intricate a braid made of many fresh flowers, wearing a delicate headdress made from sequins and beads. She\'s holding flowers, light smiling at the camera, against a backdrop adorned with orchid blooms. The scene captures her grace as she stands amidst soft pastel colors, adding to its dreamy atmosphere', 42, [], 'sim_stage1'],
 ]
 
 with gr.Blocks() as demo:
     session_state = gr.State({})
     default_model_version = "v1.0"
-    lora_state = gr.State([{"name": "None", "path": "", "weight": 1.5}])
-    custom_loras = gr.State([])  # Store [filename, full_path] pairs
+    lora_state = gr.State([{"name": "None", "path": "", "weight": 1.5, "metadata": {}}])
+    custom_loras = gr.State([])  # Store [filename, full_path, metadata] triples
 
     gr.HTML("""
     <div style="text-align: center; max-width: 900px; margin: 0 auto;">
@@ -455,6 +614,12 @@ with gr.Blocks() as demo:
         <a href="https://arxiv.org/abs/2503.16418">[Paper]</a> 
         <a href="https://github.com/bytedance/InfiniteYou">[Code]</a> 
         <a href="https://huggingface.co/ByteDance/InfiniteYou">[Model]</a>
+        <style>
+            .full-width input[type="text"] {
+                width: 100% !important;
+                box-sizing: border-box;
+            }
+        </style>
     </div>
     """)
 
@@ -503,9 +668,10 @@ with gr.Blocks() as demo:
 
             with gr.Accordion("LoRAs [Optional]", open=True) as lora_accordion:
                 lora_components = []
+                metadata_components = []
                 with gr.Column():
                     lora_dir = gr.Textbox(label="LoRA Directory", value="./loras")
-                    list_lora_btn = gr.Button("List LoRAs")
+                    list_lora_btn = gr.Button("Refresh LoRAs")
                     custom_lora_select = gr.Dropdown(
                         label="Select Custom LoRA",
                         choices=[],
@@ -535,7 +701,18 @@ with gr.Blocks() as demo:
                                 step=0.1
                             )
                             remove_btn = gr.Button(f"Remove LoRA {i+1}")
-                            lora_components.extend([lora_name, lora_path, lora_weight, remove_btn, row])
+                            lora_components.extend([lora_name, lora_path, lora_weight, None, remove_btn, row])
+                        lora_metadata = gr.Textbox(
+                            label=f"Metadata for LoRA {i+1}",
+                            value="No metadata available",
+                            interactive=False,
+                            visible=i == 0,
+                            lines=5,
+                            elem_classes="full-width",
+                            elem_id=f"lora-metadata-{i}"
+                        )
+                        metadata_components.append(lora_metadata)
+                        lora_components[3 + i*6] = lora_metadata  # Replace None with lora_metadata in lora_components
 
                         lora_name.change(
                             fn=update_lora_name,
@@ -612,7 +789,7 @@ with gr.Blocks() as demo:
                         outputs=[custom_loras],
                         queue=False
                     ).then(
-                        fn=lambda cl: gr.update(choices=[name for name, _ in cl], value=None),
+                        fn=lambda cl: gr.update(choices=[name for name, _, _ in cl], value=None),
                         inputs=[custom_loras],
                         outputs=[custom_lora_select],
                         queue=False
@@ -625,7 +802,7 @@ with gr.Blocks() as demo:
                 ### ❗️ Important Usage Tips:
                 - **Model Version**: `aes_stage2` is used by default for better text-image alignment and aesthetics. For higher ID similarity, try `sim_stage1`.
                 - **Useful Hyperparameters**: Usually, there is NO need to adjust too much. If necessary, try a slightly larger `--infusenet_guidance_start` (*e.g.*, `0.1`) only (especially helpful for `sim_stage1`). If still not satisfactory, then try a slightly smaller `--infusenet_conditioning_scale` (*e.g.*, `0.9`).
-                - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, specify a directory containing .safetensors files (defaults to `./loras`) and click "List LoRAs". LoRAs are automatically loaded from `./loras` on startup. Select a custom LoRA from the "Select Custom LoRA" dropdown to apply it to the current LoRA field, and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRAs are optional and were NOT used in our paper unless specified.
+                - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, specify a directory containing .safetensors files (defaults to `./loras`) and click "Refresh LoRAs". LoRAs are automatically loaded from `./loras` on startup. Select a custom LoRA from the "Select Custom LoRA" dropdown to apply it to the current LoRA field, and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRA metadata (e.g., trigger words, recommended weight) is displayed in the "Metadata for LoRA" field below each LoRA. LoRAs are optional and were NOT used in our paper unless specified.
                 - **Gender Prompt**: If the generated gender is not preferred, add specific words in the prompt, such as 'a man', 'a woman', *etc*. We encourage using inclusive and respectful language.
                 - **Performance Options**: Enable `8-bit quantization` to reduce memory usage and `CPU offloading` to use CPU memory for parts of the model, which can help on systems with limited GPU memory.
                 - **Automatic Saving**: Generated images are automatically saved to the `./results` folder with filenames like `index_prompt_seed.png`.
@@ -670,7 +847,7 @@ with gr.Blocks() as demo:
         outputs=[custom_loras],
         queue=False
     ).then(
-        fn=lambda cl: gr.update(choices=[name for name, _ in cl], value=None),
+        fn=lambda cl: gr.update(choices=[name for name, _, _ in cl], value=None),
         inputs=[custom_loras],
         outputs=[custom_lora_select],
         queue=False
@@ -683,7 +860,7 @@ with gr.Blocks() as demo:
     
     gr.Markdown(
         """
-        ---
+        --- 
         ### 📜 Disclaimer and Licenses 
         The images used in this demo are sourced from consented subjects or generated by the models. These pictures are intended solely to show the capabilities of our research. If you have any concerns, please contact us, and we will promptly remove any appropriate content.
         
