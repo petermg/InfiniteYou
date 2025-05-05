@@ -29,8 +29,15 @@ from safetensors.torch import load_file
 
 from pipelines.pipeline_infu_flux import InfUFluxPipeline
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG, filename='app.log', filemode='a')
+# Set up logging to both file and console
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log', mode='a'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Parse command-line arguments
@@ -352,13 +359,17 @@ def list_lora_files(directory):
         logger.error(f"Error listing LoRA files in {directory}: {e}")
         return []
 
-def update_lora_fields(lora_list):
+def update_lora_fields(lora_list, last_valid_lora_state):
     """Update visibility and values of LoRA fields and their rows based on lora_list."""
+    logger.debug(f"update_lora_fields called with lora_list: {lora_list}, last_valid_lora_state: {last_valid_lora_state}")
     updates = []
     valid_choices = ["None"] + list(AVAILABLE_LORAS.keys())
     # Ensure at least one LoRA field is visible
     if not lora_list:
-        lora_list = [{"name": "None", "path": "", "weight": 1.5, "metadata": {}}]
+        logger.warning("lora_list is empty, restoring last_valid_lora_state")
+        lora_list = last_valid_lora_state
+        if not lora_list:
+            lora_list = [{"name": "None", "path": "", "weight": 1.5, "metadata": {}}]
     for i in range(MAX_LORA_FIELDS):
         if i < len(lora_list):
             lora = lora_list[i]
@@ -389,25 +400,25 @@ def update_lora_fields(lora_list):
             gr.update(visible=visible),  # remove_btn
             gr.update(visible=visible),  # row
         ])
-    logger.debug(f"Updating LoRA fields with lora_list: {lora_list}")
+    logger.debug(f"Returning updates for lora_components: {updates}")
     return updates
 
-def add_lora(lora_list):
+def add_lora(lora_list, last_valid_lora_state):
     if len(lora_list) < MAX_LORA_FIELDS:
         new_list = lora_list + [{"name": "None", "path": "", "weight": 1.5, "metadata": {}}]
         logger.info(f"Added new LoRA. New lora_list: {new_list}")
-        return new_list
+        return new_list, len(new_list) - 1, new_list  # Update last_valid_lora_state
     logger.info("Maximum LoRA fields reached.")
-    return lora_list
+    return lora_list, None, last_valid_lora_state
 
-def remove_lora(index, lora_list):
+def remove_lora(index, lora_list, last_valid_lora_state):
     if index < len(lora_list) and len(lora_list) > 1:
         new_list = lora_list.copy()
         new_list.pop(index)
         logger.info(f"Removed LoRA at index {index}. New lora_list: {new_list}")
-        return new_list
+        return new_list, min(index, len(new_list) - 1), new_list  # Update last_valid_lora_state
     logger.warning(f"Cannot remove LoRA at index {index}. lora_list length: {len(lora_list)}")
-    return lora_list
+    return lora_list, index, last_valid_lora_state
 
 def sanitize_lora_name(name):
     """Remove invalid characters from LoRA name to make it a valid PyTorch module name."""
@@ -477,14 +488,14 @@ def update_lora(index, name, path, weight, lora_list, metadata=None):
     logger.info(f"Updated lora_list: {new_list}")
     return new_list
 
-def update_lora_name(index, name, lora_list):
+def update_lora_name(index, name, lora_list, last_valid_lora_state):
     """Update LoRA name and path based on selection."""
     logger.debug(f"update_lora_name called with index={index}, name={name}, lora_list={lora_list}")
     if index >= len(lora_list):
-        return lora_list
+        return lora_list, last_valid_lora_state
     current_lora = lora_list[index]
     if current_lora["name"].split('_')[0] == name:
-        return lora_list
+        return lora_list, last_valid_lora_state
     weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
     path = AVAILABLE_LORAS.get(name, "")
     metadata = {}
@@ -513,14 +524,19 @@ def update_lora_name(index, name, lora_list):
         except Exception as e:
             logger.warning(f"Failed to load metadata for {path}: {e}")
             metadata = {}
-    return update_lora(index, name, path, weight, lora_list, metadata)
+    new_list = update_lora(index, name, path, weight, lora_list, metadata)
+    return new_list, new_list  # Update last_valid_lora_state
 
-def select_custom_lora(index, lora_name, lora_list, custom_loras):
-    """Update lora_state with the selected custom LoRA."""
-    logger.debug(f"select_custom_lora called with index={index}, lora_name={lora_name}, lora_list={lora_list}, custom_loras={custom_loras}")
-    if index >= len(lora_list):
-        return lora_list
-    current_lora = lora_list[index]
+def select_custom_lora(active_lora_index, lora_name, lora_list, custom_loras, last_valid_lora_state):
+    """Update lora_state with the selected custom LoRA for the specified index and reset dropdown."""
+    logger.debug(f"select_custom_lora called with active_lora_index={active_lora_index}, lora_name={lora_name}, lora_list={lora_list}, custom_loras={custom_loras}, last_valid_lora_state={last_valid_lora_state}")
+    if active_lora_index is None or active_lora_index >= len(lora_list):
+        logger.warning(f"Invalid active_lora_index {active_lora_index}, no update performed")
+        return lora_list, None, last_valid_lora_state
+    if lora_name is None:
+        logger.debug("lora_name is None, skipping update to avoid resetting LoRA slot")
+        return lora_list, None, last_valid_lora_state
+    current_lora = lora_list[active_lora_index]
     weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
     path = ""
     metadata = {}
@@ -531,13 +547,15 @@ def select_custom_lora(index, lora_name, lora_list, custom_loras):
                 metadata = meta
                 break
     name = lora_name if path else "None"
-    return update_lora(index, name, path, weight, lora_list, metadata)
+    updated_list = update_lora(active_lora_index, name, path, weight, lora_list, metadata)
+    logger.debug(f"select_custom_lora returning updated_list: {updated_list}, custom_lora_select: None, last_valid_lora_state: {updated_list}")
+    return updated_list, None, updated_list  # Update last_valid_lora_state
 
-def update_lora_path(index, path, lora_list):
+def update_lora_path(index, path, lora_list, last_valid_lora_state):
     """Update LoRA path manually entered by user."""
     logger.debug(f"update_lora_path called with index={index}, path={path}, lora_list={lora_list}")
     if index >= len(lora_list):
-        return lora_list
+        return lora_list, last_valid_lora_state
     current_lora = lora_list[index]
     name = os.path.basename(path) if path and isinstance(path, str) and path.endswith('.safetensors') else "None"
     weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
@@ -570,14 +588,15 @@ def update_lora_path(index, path, lora_list):
     else:
         path = ""
     if current_lora["path"] == path:
-        return lora_list
-    return update_lora(index, name, path, weight, lora_list, metadata)
+        return lora_list, last_valid_lora_state
+    new_list = update_lora(index, name, path, weight, lora_list, metadata)
+    return new_list, new_list  # Update last_valid_lora_state
 
-def update_lora_weight(index, weight, lora_list):
+def update_lora_weight(index, weight, lora_list, last_valid_lora_state):
     """Update LoRA weight, preserving name, path, and metadata."""
     logger.debug(f"update_lora_weight called with index={index}, weight={weight}, lora_list={lora_list}")
     if index >= len(lora_list):
-        return lora_list
+        return lora_list, last_valid_lora_state
     current_lora = lora_list[index]
     name = current_lora["name"].split('_')[0] if '_' in current_lora["name"] else current_lora["name"]
     path = current_lora["path"]
@@ -587,8 +606,9 @@ def update_lora_weight(index, weight, lora_list):
     except (ValueError, TypeError):
         weight = 1.5
     if current_lora["weight"] == weight:
-        return lora_list
-    return update_lora(index, name, path, weight, lora_list, metadata)
+        return lora_list, last_valid_lora_state
+    new_list = update_lora(index, name, path, weight, lora_list, metadata)
+    return new_list, new_list  # Update last_valid_lora_state
 
 sample_list = [
     ['./assets/examples/man.jpg', None, 'A sophisticated gentleman exuding confidence. He is dressed in a 1990s brown plaid jacket with a high collar, paired with a dark grey turtleneck. His trousers are tailored and charcoal in color, complemented by a sleek leather belt. The background showcases an elegant library with bookshelves, a marble fireplace, and warm lighting, creating a refined and cozy atmosphere. His relaxed posture and casual hand-in-pocket stance add to his composed and stylish demeanor', 666, [], 'aes_stage2'],
@@ -605,6 +625,8 @@ with gr.Blocks() as demo:
     default_model_version = "v1.0"
     lora_state = gr.State([{"name": "None", "path": "", "weight": 1.5, "metadata": {}}])
     custom_loras = gr.State([])  # Store [filename, full_path, metadata] triples
+    active_lora_index = gr.State(0)  # Track which LoRA slot the custom_lora_select targets
+    last_valid_lora_state = gr.State([{"name": "None", "path": "", "weight": 1.5, "metadata": {}}])  # Cache last valid lora_state
 
     gr.HTML("""
     <div style="text-align: center; max-width: 900px; margin: 0 auto;">
@@ -716,56 +738,56 @@ with gr.Blocks() as demo:
 
                         lora_name.change(
                             fn=update_lora_name,
-                            inputs=[gr.State(value=i), lora_name, lora_state],
-                            outputs=[lora_state],
+                            inputs=[gr.State(value=i), lora_name, lora_state, last_valid_lora_state],
+                            outputs=[lora_state, last_valid_lora_state],
                             queue=False
                         ).then(
                             fn=update_lora_fields,
-                            inputs=[lora_state],
+                            inputs=[lora_state, last_valid_lora_state],
                             outputs=lora_components,
                             queue=False
                         )
                         lora_path.change(
                             fn=update_lora_path,
-                            inputs=[gr.State(value=i), lora_path, lora_state],
-                            outputs=[lora_state],
+                            inputs=[gr.State(value=i), lora_path, lora_state, last_valid_lora_state],
+                            outputs=[lora_state, last_valid_lora_state],
                             queue=False
                         ).then(
                             fn=update_lora_fields,
-                            inputs=[lora_state],
+                            inputs=[lora_state, last_valid_lora_state],
                             outputs=lora_components,
                             queue=False
                         )
                         lora_weight.change(
                             fn=update_lora_weight,
-                            inputs=[gr.State(value=i), lora_weight, lora_state],
-                            outputs=[lora_state],
+                            inputs=[gr.State(value=i), lora_weight, lora_state, last_valid_lora_state],
+                            outputs=[lora_state, last_valid_lora_state],
                             queue=False
                         ).then(
                             fn=update_lora_fields,
-                            inputs=[lora_state],
+                            inputs=[lora_state, last_valid_lora_state],
                             outputs=lora_components,
                             queue=False
                         )
                         remove_btn.click(
                             fn=remove_lora,
-                            inputs=[gr.State(value=i), lora_state],
-                            outputs=[lora_state],
+                            inputs=[gr.State(value=i), lora_state, last_valid_lora_state],
+                            outputs=[lora_state, active_lora_index, last_valid_lora_state],
                             queue=False
                         ).then(
                             fn=update_lora_fields,
-                            inputs=[lora_state],
+                            inputs=[lora_state, last_valid_lora_state],
                             outputs=lora_components,
                             queue=False
                         )
                         custom_lora_select.change(
                             fn=select_custom_lora,
-                            inputs=[gr.State(value=i), custom_lora_select, lora_state, custom_loras],
-                            outputs=[lora_state],
+                            inputs=[active_lora_index, custom_lora_select, lora_state, custom_loras, last_valid_lora_state],
+                            outputs=[lora_state, custom_lora_select, last_valid_lora_state],
                             queue=False
                         ).then(
                             fn=update_lora_fields,
-                            inputs=[lora_state],
+                            inputs=[lora_state, last_valid_lora_state],
                             outputs=lora_components,
                             queue=False
                         )
@@ -773,12 +795,12 @@ with gr.Blocks() as demo:
                     add_lora_btn = gr.Button("Add Another LoRA")
                     add_lora_btn.click(
                         fn=add_lora,
-                        inputs=[lora_state],
-                        outputs=[lora_state],
+                        inputs=[lora_state, last_valid_lora_state],
+                        outputs=[lora_state, active_lora_index, last_valid_lora_state],
                         queue=False
                     ).then(
                         fn=update_lora_fields,
-                        inputs=[lora_state],
+                        inputs=[lora_state, last_valid_lora_state],
                         outputs=lora_components,
                         queue=False
                     )
@@ -802,7 +824,7 @@ with gr.Blocks() as demo:
                 ### ❗️ Important Usage Tips:
                 - **Model Version**: `aes_stage2` is used by default for better text-image alignment and aesthetics. For higher ID similarity, try `sim_stage1`.
                 - **Useful Hyperparameters**: Usually, there is NO need to adjust too much. If necessary, try a slightly larger `--infusenet_guidance_start` (*e.g.*, `0.1`) only (especially helpful for `sim_stage1`). If still not satisfactory, then try a slightly smaller `--infusenet_conditioning_scale` (*e.g.*, `0.9`).
-                - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, specify a directory containing .safetensors files (defaults to `./loras`) and click "Refresh LoRAs". LoRAs are automatically loaded from `./loras` on startup. Select a custom LoRA from the "Select Custom LoRA" dropdown to apply it to the current LoRA field, and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRA metadata (e.g., trigger words, recommended weight) is displayed in the "Metadata for LoRA" field below each LoRA. LoRAs are optional and were NOT used in our paper unless specified.
+                - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, specify a directory containing .safetensors files (defaults to `./loras`) and click "Refresh LoRAs". LoRAs are automatically loaded from `./loras` on startup. Select a custom LoRA from the "Select Custom LoRA" dropdown to apply it to the active LoRA field (the most recently added or first available), and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRA metadata (e.g., trigger words, recommended weight) is displayed in the "Metadata for LoRA" field below each LoRA. LoRAs are optional and were NOT used in our paper unless specified.
                 - **Gender Prompt**: If the generated gender is not preferred, add specific words in the prompt, such as 'a man', 'a woman', *etc*. We encourage using inclusive and respectful language.
                 - **Performance Options**: Enable `8-bit quantization` to reduce memory usage and `CPU offloading` to use CPU memory for parts of the model, which can help on systems with limited GPU memory.
                 - **Automatic Saving**: Generated images are automatically saved to the `./results` folder with filenames like `index_prompt_seed.png`.
@@ -895,4 +917,4 @@ with gr.Blocks() as demo:
     )
 
 demo.queue()
-demo.launch(server_name='127.0.0.1')
+demo.launch(server_name='127.0.0.1',share=True)
