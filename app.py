@@ -15,6 +15,9 @@
 import argparse
 import gc
 import os
+import logging
+import glob
+import re
 
 import gradio as gr
 import pillow_avif
@@ -23,6 +26,10 @@ from huggingface_hub import snapshot_download
 from pillow_heif import register_heif_opener
 
 from pipelines.pipeline_infu_flux import InfUFluxPipeline
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, filename='app.log', filemode='a')
+logger = logging.getLogger(__name__)
 
 # Parse command-line arguments
 def parse_args():
@@ -51,11 +58,17 @@ ENABLE_REALISM_DEFAULT = False
 QUANTIZE_8BIT_DEFAULT = True
 CPU_OFFLOAD_DEFAULT = True
 OUTPUT_DIR = "./results"
+MAX_LORA_FIELDS = 5  # Maximum number of LoRA fields to display
+
+# Available built-in LoRAs
+AVAILABLE_LORAS = {
+    "realism": "./models/InfiniteYou/supports/optional_loras/flux_realism_lora.safetensors",
+    "anti-blur": "./models/InfiniteYou/supports/optional_loras/flux_anti_blur_lora.safetensors",
+}
 
 loaded_pipeline_config = {
     "model_version": "aes_stage2",
-    "enable_realism": False,
-    "enable_anti_blur": False,
+    "loras": [],
     "quantize_8bit": False,
     "cpu_offload": False,
     'pipeline': None
@@ -64,11 +77,12 @@ loaded_pipeline_config = {
 def download_models():
     global models_downloaded
     if not models_downloaded:
+        logger.info("Downloading models...")
         snapshot_download(repo_id='ByteDance/InfiniteYou', local_dir='./models/InfiniteYou', local_dir_use_symlinks=False)
         try:
             snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
         except Exception as e:
-            print(e)
+            logger.error(f"Failed to download FLUX.1-dev: {e}")
             print('\nYou are downloading `black-forest-labs/FLUX.1-dev` to `./models/FLUX.1-dev` but failed. '
                   'Please accept the agreement and obtain access at https://huggingface.co/black-forest-labs/FLUX.1-dev. '
                   'Then, use `huggingface-cli login` and your access tokens at https://huggingface.co/settings/tokens to authenticate. '
@@ -76,36 +90,45 @@ def download_models():
             print('\nYou can also download it manually from HuggingFace and put it in `./models/InfiniteYou`, '
                   'or you can modify `base_model_path` in `app.py` to specify the correct path.')
             raise Exception("Model download failed")
+        # Verify built-in LoRA files exist
+        for lora_name, lora_path in AVAILABLE_LORAS.items():
+            if not os.path.exists(lora_path):
+                logger.error(f"Built-in LoRA file missing: {lora_path}")
+                raise FileNotFoundError(f"Built-in LoRA file missing: {lora_path}")
         models_downloaded = True
+        logger.info("Models and LoRAs downloaded successfully.")
 
-def prepare_pipeline(model_version, enable_realism, enable_anti_blur, quantize_8bit, cpu_offload):
+def prepare_pipeline(model_version, loras, quantize_8bit, cpu_offload):
+    logger.info(f"Preparing pipeline with model_version={model_version}, loras={loras}, quantize_8bit={quantize_8bit}, cpu_offload={cpu_offload}")
+    
+    # Force reload if LoRAs differ to ensure they are applied
     if (
         loaded_pipeline_config['pipeline'] is not None
-        and loaded_pipeline_config["enable_realism"] == enable_realism 
-        and loaded_pipeline_config["enable_anti_blur"] == enable_anti_blur
+        and loaded_pipeline_config["loras"] == loras
         and loaded_pipeline_config["quantize_8bit"] == quantize_8bit
         and loaded_pipeline_config["cpu_offload"] == cpu_offload
         and model_version == loaded_pipeline_config["model_version"]
     ):
+        logger.info("Reusing existing pipeline.")
         return loaded_pipeline_config['pipeline']
     
-    loaded_pipeline_config["enable_realism"] = enable_realism
-    loaded_pipeline_config["enable_anti_blur"] = enable_anti_blur
+    loaded_pipeline_config["loras"] = loras
     loaded_pipeline_config["quantize_8bit"] = quantize_8bit
     loaded_pipeline_config["cpu_offload"] = cpu_offload
     loaded_pipeline_config["model_version"] = model_version
 
     pipeline = loaded_pipeline_config['pipeline']
     if pipeline is None or pipeline.model_version != model_version:
-        print(f'Switching model to {model_version}')
-        if pipeline is not None:  # Check if pipeline exists before deleting
+        logger.info(f'Switching model to {model_version}')
+        if pipeline is not None:
+            logger.info("Deleting existing pipeline.")
             del pipeline
             del loaded_pipeline_config['pipeline']
             gc.collect()
             torch.cuda.empty_cache()
 
         model_path = f'./models/InfiniteYou/infu_flux_v1.0/{model_version}'
-        print(f'Loading model from {model_path}')
+        logger.info(f'Loading model from {model_path}')
 
         pipeline = InfUFluxPipeline(
             base_model_path='./models/FLUX.1-dev',
@@ -120,13 +143,30 @@ def prepare_pipeline(model_version, enable_realism, enable_anti_blur, quantize_8
 
         loaded_pipeline_config['pipeline'] = pipeline
 
-    pipeline.pipe.delete_adapters(['realism', 'anti_blur'])
-    loras = []
-    if enable_realism:
-        loras.append(['./models/InfiniteYou/supports/optional_loras/flux_realism_lora.safetensors', 'realism', 1.0])
-    if enable_anti_blur:
-        loras.append(['./models/InfiniteYou/supports/optional_loras/flux_anti_blur_lora.safetensors', 'anti_blur', 1.0])
-    pipeline.load_loras(loras)
+    # Unload previous LoRA weights
+    try:
+        pipeline.pipe.unload_lora_weights()
+        logger.info("Unloaded previous LoRA weights.")
+    except Exception as e:
+        logger.error(f"Failed to unload LoRA weights: {e}")
+
+    # Load new LoRAs
+    if loras:
+        logger.info(f"Loading LoRAs: {loras}")
+        for lora in loras:
+            lora_path = lora[0]
+            if not os.path.exists(lora_path):
+                logger.error(f"LoRA path does not exist: {lora_path}")
+                raise FileNotFoundError(f"LoRA path does not exist: {lora_path}")
+            if not lora_path.endswith('.safetensors'):
+                logger.error(f"LoRA file must be a .safetensors file: {lora_path}")
+                raise ValueError(f"LoRA file must be a .safetensors file: {lora_path}")
+        try:
+            pipeline.load_loras(loras)
+            logger.info("LoRAs loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load LoRAs: {e}")
+            raise RuntimeError(f"Failed to load LoRAs: {e}")
 
     return pipeline
 
@@ -142,26 +182,29 @@ def generate_image(
     infusenet_conditioning_scale, 
     infusenet_guidance_start,
     infusenet_guidance_end,
-    enable_realism,
-    enable_anti_blur,
+    lora_state,
     quantize_8bit,
     cpu_offload,
     model_version
 ):
+    # Convert lora_state to loras format
+    loras = convert_lora_state_to_loras(lora_state)
+    logger.info(f"Converted lora_state to loras: {loras}")
+
     # Download models if not already done
     download_models()
 
     # Prepare pipeline with user-selected options
     pipeline = prepare_pipeline(
         model_version=model_version,
-        enable_realism=enable_realism,
-        enable_anti_blur=enable_anti_blur,
+        loras=loras,
         quantize_8bit=quantize_8bit,
         cpu_offload=cpu_offload
     )
 
     if seed == 0:
         seed = torch.seed() & 0xFFFFFFFF
+        logger.info(f"Generated random seed: {seed}")
 
     try:
         image = pipeline(
@@ -185,32 +228,223 @@ def generate_image(
         out_name = f"{index:05d}_{prompt_name}_seed{seed}.png"
         out_path = os.path.join(OUTPUT_DIR, out_name)
         image.save(out_path)
+        logger.info(f"Image saved to {out_path}")
         return gr.update(value=image, label=f"Generated Image, seed={seed}, saved to {out_path}"), str(seed)
     except Exception as e:
-        print(e)
+        logger.error(f"Error during image generation: {e}")
         gr.Error(f"An error occurred: {e}")
         return gr.update(), str(seed)
 
-def generate_examples(id_image, control_image, prompt_text, seed, enable_realism, enable_anti_blur, model_version):
+def generate_examples(id_image, control_image, prompt_text, seed, lora_state, model_version):
+    # Convert lora_state to loras format
+    loras = convert_lora_state_to_loras(lora_state)
+    logger.info(f"Generating example with loras: {loras}")
     # Use default values for quantize_8bit and cpu_offload for examples
     return generate_image(
         id_image, control_image, prompt_text, seed, 864, 1152, 3.5, 30, 1.0, 0.0, 1.0,
-        enable_realism, enable_anti_blur, QUANTIZE_8BIT_DEFAULT, CPU_OFFLOAD_DEFAULT, model_version
+        lora_state, QUANTIZE_8BIT_DEFAULT, CPU_OFFLOAD_DEFAULT, model_version
     )
 
+def convert_lora_state_to_loras(lora_state):
+    loras = []
+    for lora in lora_state:
+        if lora["name"] != "None" and lora["path"]:
+            # Ensure weight is a float
+            try:
+                weight = float(lora["weight"])
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid weight {lora['weight']} for LoRA {lora['name']}, defaulting to 1.5")
+                weight = 1.5
+            loras.append([lora["path"], lora["name"], weight])
+    logger.debug(f"Converted lora_state: {lora_state} to loras: {loras}")
+    return loras
+
+def list_lora_files(directory):
+    """Scan the directory for .safetensors files and return their filenames and full paths."""
+    logger.info(f"Listing LoRA files in directory: {directory}")
+    if not directory or not isinstance(directory, str) or not os.path.isdir(directory):
+        logger.warning(f"Invalid or non-existent directory: {directory}")
+        return []
+    try:
+        safetensors_files = glob.glob(os.path.join(directory, "*.safetensors"))
+        # Return list of [filename, full_path] pairs
+        lora_list = [[os.path.basename(f), f] for f in safetensors_files]
+        logger.info(f"Found LoRA files: {lora_list}")
+        return lora_list
+    except Exception as e:
+        logger.error(f"Error listing LoRA files in {directory}: {e}")
+        return []
+
+def update_lora_fields(lora_list):
+    """Update visibility and values of LoRA fields and their rows based on lora_list."""
+    updates = []
+    valid_choices = ["None"] + list(AVAILABLE_LORAS.keys())
+    # Ensure at least one LoRA field is visible
+    if not lora_list:
+        lora_list = [{"name": "None", "path": "", "weight": 1.5}]
+    for i in range(MAX_LORA_FIELDS):
+        if i < len(lora_list):
+            lora = lora_list[i]
+            name = lora["name"].split('_')[0] if '_' in lora["name"] and lora["name"] != "None" else lora["name"]
+            if name not in valid_choices and not lora["path"]:
+                logger.warning(f"Invalid LoRA name {name} in lora_list at index {i}, defaulting to 'None'")
+                name = "None"
+            path = lora["path"]
+            try:
+                weight = float(lora["weight"])
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid weight {lora['weight']} for LoRA {lora['name']}, defaulting to 1.5")
+                weight = 1.5
+            visible = True
+        else:
+            name = "None"
+            path = ""
+            weight = 1.5
+            visible = False
+        updates.extend([
+            gr.update(value=name, visible=visible),  # lora_name (dropdown)
+            gr.update(value=path, visible=visible and name not in valid_choices),  # lora_path (textbox)
+            gr.update(value=weight, visible=visible),  # lora_weight
+            gr.update(visible=visible),  # remove_btn
+            gr.update(visible=visible),  # row
+        ])
+    logger.debug(f"Updating LoRA fields with lora_list: {lora_list}")
+    return updates
+
+def add_lora(lora_list):
+    if len(lora_list) < MAX_LORA_FIELDS:
+        new_list = lora_list + [{"name": "None", "path": "", "weight": 1.5}]
+        logger.info(f"Added new LoRA. New lora_list: {new_list}")
+        return new_list
+    logger.info("Maximum LoRA fields reached.")
+    return lora_list
+
+def remove_lora(index, lora_list):
+    if index < len(lora_list) and len(lora_list) > 1:
+        new_list = lora_list.copy()
+        new_list.pop(index)
+        logger.info(f"Removed LoRA at index {index}. New lora_list: {new_list}")
+        return new_list
+    logger.warning(f"Cannot remove LoRA at index {index}. lora_list length: {len(lora_list)}")
+    return lora_list
+
+def sanitize_lora_name(name):
+    """Remove invalid characters from LoRA name to make it a valid PyTorch module name."""
+    if not name or name == "None":
+        return name
+    # Remove .safetensors and any invalid characters, replace with underscores
+    clean_name = re.sub(r'\.safetensors$', '', name)
+    clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', clean_name)
+    # Ensure name doesn't start with a digit
+    if clean_name and clean_name[0].isdigit():
+        clean_name = f"lora_{clean_name}"
+    logger.debug(f"Sanitized LoRA name: {name} -> {clean_name}")
+    return clean_name
+
+def update_lora(index, name, path, weight, lora_list):
+    """Update a single LoRA entry in lora_list."""
+    logger.debug(f"update_lora called with index={index}, name={name}, path={path}, weight={weight}, lora_list={lora_list}")
+    valid_choices = ["None"] + list(AVAILABLE_LORAS.keys())
+    if name not in valid_choices and not path:
+        logger.warning(f"Invalid LoRA name '{name}' at index {index}, defaulting to 'None'")
+        name = "None"
+        path = ""
+    try:
+        weight = float(weight)
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid weight '{weight}' at index {index}, defaulting to 1.5")
+        weight = 1.5
+    if path and not path.endswith('.safetensors'):
+        logger.warning(f"Invalid LoRA path '{path}' at index {index}, defaulting to 'None'")
+        name = "None"
+        path = ""
+    elif name in AVAILABLE_LORAS:
+        path = AVAILABLE_LORAS[name]
+
+    new_list = lora_list.copy()
+    if index >= len(new_list):
+        new_list.append({"name": "None", "path": "", "weight": 1.5})
+
+    # Sanitize the name for PyTorch module compatibility
+    sanitized_name = sanitize_lora_name(name)
+    unique_name = f"{sanitized_name}_{index}" if sanitized_name != "None" else "None"
+    new_list[index] = {"name": unique_name, "path": path, "weight": weight}
+    
+    logger.info(f"Updated lora_list: {new_list}")
+    return new_list
+
+def update_lora_name(index, name, lora_list):
+    """Update LoRA name and path based on selection."""
+    logger.debug(f"update_lora_name called with index={index}, name={name}, lora_list={lora_list}")
+    if index >= len(lora_list):
+        return lora_list
+    current_lora = lora_list[index]
+    if current_lora["name"].split('_')[0] == name:
+        return lora_list
+    weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
+    path = AVAILABLE_LORAS.get(name, "")
+    return update_lora(index, name, path, weight, lora_list)
+
+def select_custom_lora(index, lora_name, lora_list, custom_loras):
+    """Update lora_state with the selected custom LoRA."""
+    logger.debug(f"select_custom_lora called with index={index}, lora_name={lora_name}, lora_list={lora_list}, custom_loras={custom_loras}")
+    if index >= len(lora_list):
+        return lora_list
+    current_lora = lora_list[index]
+    weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
+    path = ""
+    if lora_name:
+        for name, full_path in custom_loras:
+            if name == lora_name:
+                path = full_path
+                break
+    name = lora_name if path else "None"
+    return update_lora(index, name, path, weight, lora_list)
+
+def update_lora_path(index, path, lora_list):
+    """Update LoRA path manually entered by user."""
+    logger.debug(f"update_lora_path called with index={index}, path={path}, lora_list={lora_list}")
+    if index >= len(lora_list):
+        return lora_list
+    current_lora = lora_list[index]
+    name = os.path.basename(path) if path and isinstance(path, str) and path.endswith('.safetensors') else "None"
+    weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
+    path = path if path and isinstance(path, str) and path.endswith('.safetensors') else ""
+    if current_lora["path"] == path:
+        return lora_list
+    return update_lora(index, name, path, weight, lora_list)
+
+def update_lora_weight(index, weight, lora_list):
+    """Update LoRA weight, preserving name and path."""
+    logger.debug(f"update_lora_weight called with index={index}, weight={weight}, lora_list={lora_list}")
+    if index >= len(lora_list):
+        return lora_list
+    current_lora = lora_list[index]
+    name = current_lora["name"].split('_')[0] if '_' in current_lora["name"] else current_lora["name"]
+    path = current_lora["path"]
+    try:
+        weight = float(weight)
+    except (ValueError, TypeError):
+        weight = 1.5
+    if current_lora["weight"] == weight:
+        return lora_list
+    return update_lora(index, name, path, weight, lora_list)
+
 sample_list = [
-    ['./assets/examples/man.jpg', None, 'A sophisticated gentleman exuding confidence. He is dressed in a 1990s brown plaid jacket with a high collar, paired with a dark grey turtleneck. His trousers are tailored and charcoal in color, complemented by a sleek leather belt. The background showcases an elegant library with bookshelves, a marble fireplace, and warm lighting, creating a refined and cozy atmosphere. His relaxed posture and casual hand-in-pocket stance add to his composed and stylish demeanor', 666, False, False, 'aes_stage2'],
-    ['./assets/examples/man.jpg', './assets/examples/man_pose.jpg', 'A man, portrait, cinematic', 42, True, False, 'aes_stage2'],
-    ['./assets/examples/man.jpg', None, 'A man, portrait, cinematic', 12345, False, False, 'sim_stage1'],
-    ['./assets/examples/woman.jpg', './assets/examples/woman.jpg', 'A woman, portrait, cinematic', 1621695706, False, False, 'sim_stage1'],
-    ['./assets/examples/woman.jpg', None, 'A young woman holding a sign with the text "InfiniteYou", "Infinite" in black and "You" in red, pure background', 3724009365, False, False, 'aes_stage2'],
-    ['./assets/examples/woman.jpg', None, 'A photo of an elegant Javanese bride in traditional attire, with long hair styled into intricate a braid made of many fresh flowers, wearing a delicate headdress made from sequins and beads. She\'s holding flowers, light smiling at the camera, against a backdrop adorned with orchid blooms. The scene captures her grace as she stands amidst soft pastel colors, adding to its dreamy atmosphere', 42, True, False, 'aes_stage2'],
-    ['./assets/examples/woman.jpg', None, 'A photo of an elegant Javanese bride in traditional attire, with long hair styled into intricate a braid made of many fresh flowers, wearing a delicate headdress made from sequins and beads. She\'s holding flowers, light smiling at the camera, against a backdrop adorned with orchid blooms. The scene captures her grace as she stands amidst soft pastel colors, adding to its dreamy atmosphere', 42, False, False, 'sim_stage1'],
+    ['./assets/examples/man.jpg', None, 'A sophisticated gentleman exuding confidence. He is dressed in a 1990s brown plaid jacket with a high collar, paired with a dark grey turtleneck. His trousers are tailored and charcoal in color, complemented by a sleek leather belt. The background showcases an elegant library with bookshelves, a marble fireplace, and warm lighting, creating a refined and cozy atmosphere. His relaxed posture and casual hand-in-pocket stance add to his composed and stylish demeanor', 666, [], 'aes_stage2'],
+    ['./assets/examples/man.jpg', './assets/examples/man_pose.jpg', 'A man, portrait, cinematic', 42, [{"name": "realism_1", "path": AVAILABLE_LORAS["realism"], "weight": 1.5}], 'aes_stage2'],
+    ['./assets/examples/man.jpg', None, 'A man, portrait, cinematic', 12345, [], 'sim_stage1'],
+    ['./assets/examples/woman.jpg', './assets/examples/woman.jpg', 'A woman, portrait, cinematic', 1621695706, [], 'sim_stage1'],
+    ['./assets/examples/woman.jpg', None, 'A young woman holding a sign with the text "InfiniteYou", "Infinite" in black and "You" in red, pure background', 3724009365, [], 'aes_stage2'],
+    ['./assets/examples/woman.jpg', None, 'A photo of an elegant Javanese bride in traditional attire, with long hair styled into intricate a braid made of many fresh flowers, wearing a delicate headdress made from sequins and beads. She\'s holding flowers, light smiling at the camera, against a backdrop adorned with orchid blooms. The scene captures her grace as she stands amidst soft pastel colors, adding to its dreamy atmosphere', 42, [{"name": "realism_1", "path": AVAILABLE_LORAS["realism"], "weight": 1.5}], 'aes_stage2'],
+    ['./assets/examples/woman.jpg', None, 'A photo of an elegant Javanese bride in traditional attire, with long hair styled into intricate a braid made of many fresh flowers, wearing a delicate headdress made from sequins and beads. She\'s holding flowers, light smiling at the camera, against a backdrop adorned with orchid blooms. The scene captures her grace as she stands amidst soft pastel colors, adding to its dreamy atmosphere', 42, [], 'sim_stage1'],
 ]
 
 with gr.Blocks() as demo:
     session_state = gr.State({})
     default_model_version = "v1.0"
+    lora_state = gr.State([{"name": "None", "path": "", "weight": 1.5}])
+    custom_loras = gr.State([])  # Store [filename, full_path] pairs
 
     gr.HTML("""
     <div style="text-align: center; max-width: 900px; margin: 0 auto;">
@@ -233,12 +467,12 @@ with gr.Blocks() as demo:
     """)
     
     with gr.Row():
-        with gr.Column(scale=3):
+        with gr.Column():
             with gr.Row():
-                ui_id_image = gr.Image(label="Identity Image", type="pil", scale=3, height=370, min_width=100)
+                ui_id_image = gr.Image(label="Identity Image", type="pil", height=370)
 
-                with gr.Column(scale=2, min_width=100):
-                    ui_control_image = gr.Image(label="Control Image [Optional]", type="pil", height=370, min_width=100)
+                with gr.Column():
+                    ui_control_image = gr.Image(label="Control Image [Optional]", type="pil", height=370)
             
             ui_prompt_text = gr.Textbox(label="Prompt", value="Portrait, 4K, high quality, cinematic")
             ui_model_version = gr.Dropdown(
@@ -257,7 +491,7 @@ with gr.Blocks() as demo:
                 with gr.Row():
                     ui_width = gr.Number(label="width", value=864)
                     ui_height = gr.Number(label="height", value=1152)
-                ui_guidance_scale = gr.Number(label="guidance scale", value=3.5, step=0.5)
+                ui_guidance_scale = gr.Number(label="guidance scale", value=3.5)
                 ui_infusenet_conditioning_scale = gr.Slider(minimum=0.0, maximum=1.0, value=1.0, step=0.05, label="infusenet conditioning scale")
                 with gr.Row():
                     ui_infusenet_guidance_start = gr.Slider(minimum=0.0, maximum=1.0, value=0.0, step=0.05, label="infusenet guidance start")
@@ -266,19 +500,134 @@ with gr.Blocks() as demo:
                     ui_quantize_8bit = gr.Checkbox(label="Enable 8-bit quantization", value=True)
                     ui_cpu_offload = gr.Checkbox(label="Enable CPU offloading", value=True)
 
-            with gr.Accordion("LoRAs [Optional]", open=True):
-                with gr.Row():
-                    ui_enable_realism = gr.Checkbox(label="Enable realism LoRA", value=ENABLE_REALISM_DEFAULT)
-                    ui_enable_anti_blur = gr.Checkbox(label="Enable anti-blur LoRA", value=ENABLE_ANTI_BLUR_DEFAULT)
+            with gr.Accordion("LoRAs [Optional]", open=True) as lora_accordion:
+                lora_components = []
+                with gr.Column():
+                    lora_dir = gr.Textbox(
+                        label="LoRA Directory (e.g., C:\\AI\\AIModels\\Flux)",
+                        value=""
+                    )
+                    list_lora_btn = gr.Button("List LoRAs")
+                    custom_lora_select = gr.Dropdown(
+                        label="Select Custom LoRA",
+                        choices=[],
+                        value=None,
+                        allow_custom_value=True,
+                        interactive=True
+                    )
+                    for i in range(MAX_LORA_FIELDS):
+                        with gr.Row(visible=i == 0) as row:
+                            lora_name = gr.Dropdown(
+                                label=f"LoRA {i+1}",
+                                choices=["None"] + list(AVAILABLE_LORAS.keys()),
+                                value="None",
+                                allow_custom_value=True
+                            )
+                            lora_path = gr.Textbox(
+                                label=f"LoRA Path {i+1} (Selected LoRA)",
+                                value="",
+                                visible=False,
+                                elem_id=f"lora-path-{i}"
+                            )
+                            lora_weight = gr.Slider(
+                                label=f"LoRA Weight {i+1}",
+                                minimum=0.0,
+                                maximum=2.0,
+                                value=1.5,
+                                step=0.1
+                            )
+                            remove_btn = gr.Button(f"Remove LoRA {i+1}")
+                            lora_components.extend([lora_name, lora_path, lora_weight, remove_btn, row])
 
-        with gr.Column(scale=2):
+                        lora_name.change(
+                            fn=update_lora_name,
+                            inputs=[gr.State(value=i), lora_name, lora_state],
+                            outputs=[lora_state],
+                            queue=False
+                        ).then(
+                            fn=update_lora_fields,
+                            inputs=[lora_state],
+                            outputs=lora_components,
+                            queue=False
+                        )
+                        lora_path.change(
+                            fn=update_lora_path,
+                            inputs=[gr.State(value=i), lora_path, lora_state],
+                            outputs=[lora_state],
+                            queue=False
+                        ).then(
+                            fn=update_lora_fields,
+                            inputs=[lora_state],
+                            outputs=lora_components,
+                            queue=False
+                        )
+                        lora_weight.change(
+                            fn=update_lora_weight,
+                            inputs=[gr.State(value=i), lora_weight, lora_state],
+                            outputs=[lora_state],
+                            queue=False
+                        ).then(
+                            fn=update_lora_fields,
+                            inputs=[lora_state],
+                            outputs=lora_components,
+                            queue=False
+                        )
+                        remove_btn.click(
+                            fn=remove_lora,
+                            inputs=[gr.State(value=i), lora_state],
+                            outputs=[lora_state],
+                            queue=False
+                        ).then(
+                            fn=update_lora_fields,
+                            inputs=[lora_state],
+                            outputs=lora_components,
+                            queue=False
+                        )
+                        custom_lora_select.change(
+                            fn=select_custom_lora,
+                            inputs=[gr.State(value=i), custom_lora_select, lora_state, custom_loras],
+                            outputs=[lora_state],
+                            queue=False
+                        ).then(
+                            fn=update_lora_fields,
+                            inputs=[lora_state],
+                            outputs=lora_components,
+                            queue=False
+                        )
+
+                    add_lora_btn = gr.Button("Add Another LoRA")
+                    add_lora_btn.click(
+                        fn=add_lora,
+                        inputs=[lora_state],
+                        outputs=[lora_state],
+                        queue=False
+                    ).then(
+                        fn=update_lora_fields,
+                        inputs=[lora_state],
+                        outputs=lora_components,
+                        queue=False
+                    )
+
+                    list_lora_btn.click(
+                        fn=list_lora_files,
+                        inputs=[lora_dir],
+                        outputs=[custom_loras],
+                        queue=False
+                    ).then(
+                        fn=lambda cl: gr.update(choices=[name for name, _ in cl], value=None),
+                        inputs=[custom_loras],
+                        outputs=[custom_lora_select],
+                        queue=False
+                    )
+
+        with gr.Column():
             image_output = gr.Image(label="Generated Image", interactive=False, height=550, format='png')
             gr.Markdown(
                 """
                 ### ❗️ Important Usage Tips:
                 - **Model Version**: `aes_stage2` is used by default for better text-image alignment and aesthetics. For higher ID similarity, try `sim_stage1`.
                 - **Useful Hyperparameters**: Usually, there is NO need to adjust too much. If necessary, try a slightly larger `--infusenet_guidance_start` (*e.g.*, `0.1`) only (especially helpful for `sim_stage1`). If still not satisfactory, then try a slightly smaller `--infusenet_conditioning_scale` (*e.g.*, `0.9`).
-                - **Optional LoRAs**: `realism` and `anti-blur`. To enable them, please check the corresponding boxes. If needed, try `realism` only first. They are optional and were NOT used in our paper.
+                - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, enter a directory path (e.g., `C:\\AI\\AIModels\\Flux`) in "LoRA Directory" and click "List LoRAs" to populate the "Select Custom LoRA" dropdown with .safetensors files. Select a custom LoRA to apply it to the current LoRA field, and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRAs are optional and were NOT used in our paper unless specified.
                 - **Gender Prompt**: If the generated gender is not preferred, add specific words in the prompt, such as 'a man', 'a woman', *etc*. We encourage using inclusive and respectful language.
                 - **Performance Options**: Enable `8-bit quantization` to reduce memory usage and `CPU offloading` to use CPU memory for parts of the model, which can help on systems with limited GPU memory.
                 - **Automatic Saving**: Generated images are automatically saved to the `./results` folder with filenames like `index_prompt_seed.png`.
@@ -288,14 +637,14 @@ with gr.Blocks() as demo:
 
     gr.Examples(
         sample_list,
-        inputs=[ui_id_image, ui_control_image, ui_prompt_text, ui_seed, ui_enable_realism, ui_enable_anti_blur, ui_model_version],
+        inputs=[ui_id_image, ui_control_image, ui_prompt_text, ui_seed, lora_state, ui_model_version],
         outputs=[image_output, ui_last_seed],
         fn=generate_examples,
         cache_examples=False,
     )
 
     ui_btn_generate.click(
-        generate_image, 
+        fn=generate_image, 
         inputs=[
             ui_id_image, 
             ui_control_image, 
@@ -308,8 +657,7 @@ with gr.Blocks() as demo:
             ui_infusenet_conditioning_scale, 
             ui_infusenet_guidance_start,
             ui_infusenet_guidance_end,
-            ui_enable_realism,
-            ui_enable_anti_blur,
+            lora_state,
             ui_quantize_8bit,
             ui_cpu_offload,
             ui_model_version
@@ -360,5 +708,4 @@ with gr.Blocks() as demo:
     )
 
 demo.queue()
-demo.launch(server_name='0.0.0.0', share=True)  # IPv4
-# demo.launch(server_name='[::]')  # IPv6
+demo.launch(server_name='127.0.0.1')
