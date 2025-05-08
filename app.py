@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+from datetime import datetime
 import argparse
 import gc
 import os
@@ -26,6 +26,7 @@ import torch
 from huggingface_hub import snapshot_download
 from pillow_heif import register_heif_opener
 from safetensors.torch import load_file
+from PIL import PngImagePlugin
 
 from pipelines.pipeline_infu_flux import InfUFluxPipeline
 
@@ -83,14 +84,15 @@ loaded_pipeline_config = {
     'pipeline': None
 }
 
+time = (datetime.now().strftime("%Y%m%d%H%M%S"))
+
 def download_models():
     global models_downloaded
     if not models_downloaded:
         logger.info("Downloading models...")
         snapshot_download(repo_id='ByteDance/InfiniteYou', local_dir='./models/InfiniteYou', local_dir_use_symlinks=False)
         try:
-            # snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
-            snapshot_download(repo_id='ChuckMcSneed/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
+            snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
         except Exception as e:
             logger.error(f"Failed to download FLUX.1-dev: {e}")
             print('\nYou are downloading `black-forest-labs/FLUX.1-dev` to `./models/FLUX.1-dev` but failed. '
@@ -231,14 +233,46 @@ def generate_image(
             infusenet_guidance_end=infusenet_guidance_end,
             cpu_offload=cpu_offload,
         )
-        # Save the generated image
+        # Save the generated image with metadata
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         index = len(os.listdir(OUTPUT_DIR))
         prompt_name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in prompt[:50].replace(' ', '_')).strip('_')
-        out_name = f"{index:05d}_{prompt_name}_seed{seed}.png"
+        out_name = f"{index:05d}_{prompt_name}_seed{seed}_time{time}.png"
         out_path = os.path.join(OUTPUT_DIR, out_name)
-        image.save(out_path)
-        logger.info(f"Image saved to {out_path}")
+
+        # Create metadata dictionary
+        metadata = {
+            "prompt": prompt,
+            "loras": [
+                {
+                    "name": lora["name"],
+                    "path": lora["path"],
+                    "weight": lora["weight"]
+                } for lora in lora_state if lora["name"] != "None" and lora["path"]
+            ],
+            "model_version": model_version,
+            "guidance_scale": guidance_scale,
+            "num_steps": num_steps,
+            "seed": seed,
+            "width": width,
+            "height": height,
+            "infusenet_conditioning_scale": infusenet_conditioning_scale,
+            "infusenet_guidance_start": infusenet_guidance_start,
+            "infusenet_guidance_end": infusenet_guidance_end,
+            "quantize_8bit": quantize_8bit,
+            "cpu_offload": cpu_offload
+        }
+
+        # Convert metadata to JSON string
+        metadata_json = json.dumps(metadata, indent=2)
+
+        # Create PngInfo object for metadata
+        png_info = PngImagePlugin.PngInfo()
+        png_info.add_text("parameters", metadata_json)
+
+        # Save image with metadata
+        image.save(out_path, pnginfo=png_info)
+        logger.info(f"Image saved to {out_path} with metadata: {metadata_json}")
         return gr.update(value=image, label=f"Generated Image, seed={seed}, saved to {out_path}"), str(seed)
     except Exception as e:
         logger.error(f"Error during image generation: {e}")
