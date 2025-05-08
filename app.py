@@ -92,7 +92,8 @@ def download_models():
         logger.info("Downloading models...")
         snapshot_download(repo_id='ByteDance/InfiniteYou', local_dir='./models/InfiniteYou', local_dir_use_symlinks=False)
         try:
-            snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
+            # snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
+            snapshot_download(repo_id='ChuckMcSneed/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
         except Exception as e:
             logger.error(f"Failed to download FLUX.1-dev: {e}")
             print('\nYou are downloading `black-forest-labs/FLUX.1-dev` to `./models/FLUX.1-dev` but failed. '
