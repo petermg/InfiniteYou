@@ -92,7 +92,7 @@ def download_models():
         logger.info("Downloading models...")
         snapshot_download(repo_id='ByteDance/InfiniteYou', local_dir='./models/InfiniteYou', local_dir_use_symlinks=False)
         try:
-            # snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
+             # snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
             snapshot_download(repo_id='ChuckMcSneed/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
         except Exception as e:
             logger.error(f"Failed to download FLUX.1-dev: {e}")
@@ -198,7 +198,8 @@ def generate_image(
     lora_state,
     quantize_8bit,
     cpu_offload,
-    model_version
+    model_version,
+    num_images
 ):
     # Convert lora_state to loras format
     loras = convert_lora_state_to_loras(lora_state)
@@ -215,80 +216,109 @@ def generate_image(
         cpu_offload=cpu_offload
     )
 
-    if seed == 0:
-        seed = torch.seed() & 0xFFFFFFFF
-        logger.info(f"Generated random seed: {seed}")
-
+    # Ensure num_images is a positive integer
     try:
-        image = pipeline(
-            id_image=input_image,
-            prompt=prompt,
-            control_image=control_image,
-            seed=seed,
-            width=width,
-            height=height,
-            guidance_scale=guidance_scale,
-            num_steps=num_steps,
-            infusenet_conditioning_scale=infusenet_conditioning_scale,
-            infusenet_guidance_start=infusenet_guidance_start,
-            infusenet_guidance_end=infusenet_guidance_end,
-            cpu_offload=cpu_offload,
-        )
-        # Save the generated image with metadata
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        index = len(os.listdir(OUTPUT_DIR))
-        prompt_name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in prompt[:50].replace(' ', '_')).strip('_')
-        out_name = f"{index:05d}_{prompt_name}_seed{seed}_time{time}.png"
-        out_path = os.path.join(OUTPUT_DIR, out_name)
+        num_images = int(num_images)
+        if num_images < 1:
+            num_images = 1
+    except (ValueError, TypeError):
+        num_images = 1
+    logger.info(f"Generating {num_images} images")
 
-        # Create metadata dictionary
-        metadata = {
-            "prompt": prompt,
-            "loras": [
-                {
-                    "name": lora["name"],
-                    "path": lora["path"],
-                    "weight": lora["weight"]
-                } for lora in lora_state if lora["name"] != "None" and lora["path"]
-            ],
-            "model_version": model_version,
-            "guidance_scale": guidance_scale,
-            "num_steps": num_steps,
-            "seed": seed,
-            "width": width,
-            "height": height,
-            "infusenet_conditioning_scale": infusenet_conditioning_scale,
-            "infusenet_guidance_start": infusenet_guidance_start,
-            "infusenet_guidance_end": infusenet_guidance_end,
-            "quantize_8bit": quantize_8bit,
-            "cpu_offload": cpu_offload
-        }
+    images = []
+    seeds = []
+    base_seed = seed
 
-        # Convert metadata to JSON string
-        metadata_json = json.dumps(metadata, indent=2)
+    for i in range(num_images):
+        # Generate a unique seed for each image if seed is 0 (random)
+        current_seed = base_seed
+        if current_seed == 0:
+            current_seed = torch.seed() & 0xFFFFFFFF
+            logger.info(f"Generated random seed for image {i+1}: {current_seed}")
+        else:
+            # Increment seed for each image to ensure different results
+            current_seed = base_seed + i
+            logger.info(f"Using seed for image {i+1}: {current_seed}")
 
-        # Create PngInfo object for metadata
-        png_info = PngImagePlugin.PngInfo()
-        png_info.add_text("parameters", metadata_json)
+        try:
+            image = pipeline(
+                id_image=input_image,
+                prompt=prompt,
+                control_image=control_image,
+                seed=current_seed,
+                width=width,
+                height=height,
+                guidance_scale=guidance_scale,
+                num_steps=num_steps,
+                infusenet_conditioning_scale=infusenet_conditioning_scale,
+                infusenet_guidance_start=infusenet_guidance_start,
+                infusenet_guidance_end=infusenet_guidance_end,
+                cpu_offload=cpu_offload,
+            )
+            # Save the generated image with metadata
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            index = len(os.listdir(OUTPUT_DIR))
+            prompt_name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in prompt[:50].replace(' ', '_')).strip('_')
+            out_name = f"{index:05d}_{prompt_name}_seed{current_seed}_time{time}_img{i+1}.png"
+            out_path = os.path.join(OUTPUT_DIR, out_name)
 
-        # Save image with metadata
-        image.save(out_path, pnginfo=png_info)
-        logger.info(f"Image saved to {out_path} with metadata: {metadata_json}")
-        return gr.update(value=image, label=f"Generated Image, seed={seed}, saved to {out_path}"), str(seed)
-    except Exception as e:
-        logger.error(f"Error during image generation: {e}")
-        gr.Error(f"An error occurred: {e}")
-        return gr.update(), str(seed)
+            # Create metadata dictionary
+            metadata = {
+                "prompt": prompt,
+                "loras": [
+                    {
+                        "name": lora["name"],
+                        "path": lora["path"],
+                        "weight": lora["weight"]
+                    } for lora in lora_state if lora["name"] != "None" and lora["path"]
+                ],
+                "model_version": model_version,
+                "guidance_scale": guidance_scale,
+                "num_steps": num_steps,
+                "seed": current_seed,
+                "width": width,
+                "height": height,
+                "infusenet_conditioning_scale": infusenet_conditioning_scale,
+                "infusenet_guidance_start": infusenet_guidance_start,
+                "infusenet_guidance_end": infusenet_guidance_end,
+                "quantize_8bit": quantize_8bit,
+                "cpu_offload": cpu_offload,
+                "image_number": i + 1
+            }
+
+            # Convert metadata to JSON string
+            metadata_json = json.dumps(metadata, indent=2)
+
+            # Create PngInfo object for metadata
+            png_info = PngImagePlugin.PngInfo()
+            png_info.add_text("parameters", metadata_json)
+
+            # Save image with metadata
+            image.save(out_path, pnginfo=png_info)
+            logger.info(f"Image {i+1} saved to {out_path} with metadata: {metadata_json}")
+            images.append(image)
+            seeds.append(str(current_seed))
+        except Exception as e:
+            logger.error(f"Error during image {i+1} generation: {e}")
+            gr.Error(f"An error occurred during image {i+1} generation: {e}")
+            continue
+
+    if not images:
+        return gr.update(), ",".join(seeds)
+    return gr.update(value=images, label=f"Generated Images, seeds={','.join(seeds)}, saved to {OUTPUT_DIR}"), ",".join(seeds)
 
 def generate_examples(id_image, control_image, prompt_text, seed, lora_state, model_version):
     # Convert lora_state to loras format
     loras = convert_lora_state_to_loras(lora_state)
     logger.info(f"Generating example with loras: {loras}")
-    # Use default values for quantize_8bit and cpu_offload for examples
-    return generate_image(
+    # Use default values for quantize_8bit, cpu_offload, and num_images=1 for examples
+    result, last_seed = generate_image(
         id_image, control_image, prompt_text, seed, 864, 1152, 3.5, 30, 1.0, 0.0, 1.0,
-        lora_state, QUANTIZE_8BIT_DEFAULT, CPU_OFFLOAD_DEFAULT, model_version
+        lora_state, QUANTIZE_8BIT_DEFAULT, CPU_OFFLOAD_DEFAULT, model_version, num_images=1
     )
+    # Since generate_image returns a list, extract the first image for examples
+    images = result.value if isinstance(result.value, list) else [result.value] if result.value else []
+    return gr.update(value=images, label=f"Generated Example, seed={last_seed}"), last_seed
 
 def convert_lora_state_to_loras(lora_state):
     loras = []
@@ -687,7 +717,8 @@ with gr.Blocks() as demo:
     2. **Enter the text prompt to describe the generated image and select the model version.** Please refer to **important usage tips** under the Generated Image field.
     3. *[Optional] Upload a control image containing a human face.* Only five facial keypoints will be extracted to control the generation. If not provided, we use a black control image, indicating no control.
     4. *[Optional] Adjust advanced hyperparameters or apply optional LoRAs to meet personal needs.* Please refer to **important usage tips** under the Generated Image field.
-    5. **Click the "Generate" button to generate an image.** Enjoy!
+    5. **Specify the number of images to generate (default is 1).**
+    6. **Click the "Generate" button to generate images.** Enjoy!
     """)
     
     with gr.Row():
@@ -711,7 +742,7 @@ with gr.Blocks() as demo:
                     ui_num_steps = gr.Number(label="num steps", value=30)
                     ui_seed = gr.Number(label="seed (0 for random)", value=0)
                 with gr.Row():
-                    ui_last_seed = gr.Textbox(label="Last Seed Used", value="", interactive=False)
+                    ui_last_seed = gr.Textbox(label="Last Seeds Used", value="", interactive=False)
                 with gr.Row():
                     ui_width = gr.Number(label="width", value=864)
                     ui_height = gr.Number(label="height", value=1152)
@@ -723,6 +754,7 @@ with gr.Blocks() as demo:
                 with gr.Row():
                     ui_quantize_8bit = gr.Checkbox(label="Enable 8-bit quantization", value=True)
                     ui_cpu_offload = gr.Checkbox(label="Enable CPU offloading", value=True)
+                ui_num_images = gr.Number(label="Number of Images to Generate", value=1, minimum=1, precision=0)
 
             with gr.Accordion("LoRAs [Optional]", open=True) as lora_accordion:
                 lora_components = []
@@ -854,7 +886,7 @@ with gr.Blocks() as demo:
                     )
 
         with gr.Column():
-            image_output = gr.Image(label="Generated Image", interactive=False, height=550, format='png')
+            image_output = gr.Gallery(label="Generated Images", interactive=False, height=550, format='png')
             gr.Markdown(
                 """
                 ### ❗️ Important Usage Tips:
@@ -863,8 +895,9 @@ with gr.Blocks() as demo:
                 - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, specify a directory containing .safetensors files (defaults to `./loras`) and click "Refresh LoRAs". LoRAs are automatically loaded from `./loras` on startup. Select a custom LoRA from the "Select Custom LoRA" dropdown to apply it to the active LoRA field (the most recently added or first available), and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRA metadata (e.g., trigger words, recommended weight) is displayed in the "Metadata for LoRA" field below each LoRA. LoRAs are optional and were NOT used in our paper unless specified.
                 - **Gender Prompt**: If the generated gender is not preferred, add specific words in the prompt, such as 'a man', 'a woman', *etc*. We encourage using inclusive and respectful language.
                 - **Performance Options**: Enable `8-bit quantization` to reduce memory usage and `CPU offloading` to use CPU memory for parts of the model, which can help on systems with limited GPU memory.
-                - **Automatic Saving**: Generated images are automatically saved to the `./results` folder with filenames like `index_prompt_seed.png`.
-                - **Reusing Seeds**: The "Last Seed Used" field shows the seed from the most recent generation. Copy it to the "seed" input to reuse it.
+                - **Automatic Saving**: Generated images are automatically saved to the `./results` folder with filenames like `index_prompt_seed_imgN.png`.
+                - **Reusing Seeds**: The "Last Seeds Used" field shows the seeds from the most recent generation. Copy them to the "seed" input to reuse them.
+                - **Multiple Images**: Specify the number of images to generate (default is 1). Each image uses a unique seed (incremented from the base seed or random if set to 0).
                 """
             )
 
@@ -893,7 +926,8 @@ with gr.Blocks() as demo:
             lora_state,
             ui_quantize_8bit,
             ui_cpu_offload,
-            ui_model_version
+            ui_model_version,
+            ui_num_images
         ], 
         outputs=[image_output, ui_last_seed], 
         concurrency_id="gpu"
@@ -953,4 +987,4 @@ with gr.Blocks() as demo:
     )
 
 demo.queue()
-demo.launch(server_name='127.0.0.1',share=True)
+demo.launch(server_name='127.0.0.1', share=True)
