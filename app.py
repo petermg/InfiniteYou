@@ -978,7 +978,7 @@ with gr.Blocks() as demo:
 
     gr.Markdown("""
     ### 💡 How to Use This Demo:
-    1. **Upload multiple identity (ID) images of the same person's face.** These images will be processed to select the best face, create an averaged composite, or average embeddings based on the "Face Selection Mode". Each image should contain a clear, large face without significant occlusions or blur.
+    1. **Upload multiple identity (ID) images of the same person's face.** These images will be processed to select the best face, create an averaged composite, or average embeddings based on the "Face Selection Mode". Each image should contain a clear, large face without significant occlusions or blur. Supported formats: PNG, JPG, JPEG, HEIF, WebP.
     2. **Enter the text prompt to describe the generated image and select the model version.** Please refer to **important usage tips** under the Generated Image field.
     3. *[Optional] Upload a control image containing a human face.* Only five facial keypoints will be extracted to control the generation. If not provided, we use a black control image, indicating no control.
     4. *[Optional] Adjust advanced hyperparameters or apply optional LoRAs to meet personal needs.* Please refer to **important usage tips** under the Generated Image field.
@@ -989,7 +989,7 @@ with gr.Blocks() as demo:
     with gr.Row():
         with gr.Column():
             with gr.Row():
-                ui_id_image = gr.File(label="Identity Images (Multiple of Same Face)", file_types=[".png", ".jpg", ".jpeg", ".heif"], file_count="multiple", height=370)
+                ui_id_image = gr.File(label="Identity Images (Multiple of Same Face)", file_types=[".png", ".jpg", ".jpeg", ".heif", ".webp"], file_count="multiple", height=370)
 
                 with gr.Column():
                     ui_control_image = gr.Image(label="Control Image [Optional]", type="pil", height=370)
@@ -1156,7 +1156,7 @@ with gr.Blocks() as demo:
                 - **Performance Options**: Enable `8-bit quantization` to reduce memory usage and `CPU offloading` to use CPU memory for parts of the model, which can help on systems with limited GPU memory. Enable `Debug to Log File` to write logs to `app.log` and `pipeline.log` for debugging; disable when not needed to avoid unnecessary file writes.
                 - **Automatic Saving**: Generated images are automatically saved to the `./results` folder with filenames like `index_prompt_seed_imgN.png`.
                 - **Reusing Seeds**: The "Last Seeds Used" field shows the seeds from the most recent generation. Copy them to the "seed" input to reuse them.
-                - **Multiple Images**: Upload multiple images of the same face to improve identity accuracy. The system selects the best image, averages them, or uses embeddings based on the "Face Selection Mode". Specify the number of output images to generate (default is 1). Each image uses a unique seed (incremented from the base seed or random if set to 0).
+                - **Multiple Images**: Upload multiple images of the same face to improve identity accuracy. The system selects the best image, averages them, or uses embeddings based on the "Face Selection Mode". Supported formats: PNG, JPG, JPEG, HEIF, WebP. Specify the number of output images to generate (default is 1). Each image uses a unique seed (incremented from the base seed or random if set to 0).
                 - **Debugging**: Intermediate images for each face selection mode are saved to `./results/intermediates` (e.g., `best_face_<time>.png`, `averaged_face_<time>.png`, `averaged_embedding_<time>.png`) to verify differences.
                 """
             )
@@ -1233,7 +1233,7 @@ with gr.Blocks() as demo:
         }
         ```
 
-        We also appreciate it if you could give a star ⭐ to our [Github repository](https://github.com/bytedance/InfiniteYou). Thanks a lot!
+        We also appreciate it if you could give a star â­� to our [Github repository](https://github.com/bytedance/InfiniteYou). Thanks a lot!
         """
     )
 
