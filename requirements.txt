@@ -113,7 +113,6 @@ tifffile==2025.3.30
 tokenizers==0.21.1
 tomlkit==0.13.2
 torch==2.6.0+cu124
-torchaudio==2.6.0+cu124
 torchvision==0.21.0+cu124
 tqdm==4.67.1
 transformers==4.48.0
