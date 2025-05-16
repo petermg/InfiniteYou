@@ -33,8 +33,23 @@ from .pipeline_flux_infusenet import FluxInfuseNetPipeline
 from .resampler import Resampler
 import logging
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG, filename='pipeline.log', filemode='a')
+# Configure logging for the pipeline
+def configure_pipeline_logging(debug_to_log):
+    # Remove existing handlers to avoid duplicates
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    
+    handlers = [logging.StreamHandler()]
+    if debug_to_log:
+        handlers.append(logging.FileHandler('pipeline.log', mode='a', encoding='utf-8'))
+    
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=handlers,
+        force=True
+    )
+
 logger = logging.getLogger(__name__)
 
 def seed_everything(seed, deterministic=False):
@@ -128,13 +143,16 @@ class InfUFluxPipeline:
             self, 
             base_model_path, 
             infu_model_path, 
-            insightface_root_path = './',
+            insightface_root_path='./',
             image_proj_num_tokens=8,
             infu_flux_version='v1.0',
             model_version='aes_stage2',
             quantize_8bit=False,
             cpu_offload=False,
+            debug_to_log=False
         ):
+        configure_pipeline_logging(debug_to_log)
+        logger.info("Initializing InfUFluxPipeline")
 
         self.infu_flux_version = infu_flux_version
         self.model_version = model_version
@@ -331,6 +349,72 @@ class InfUFluxPipeline:
         # Perform inference
         logger.info('Generating image')
         seed_everything(seed)
+        image = self.pipe(
+            prompt=prompt,
+            controlnet_prompt_embeds=id_embed,
+            control_image=control_image,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_steps,
+            controlnet_guidance_scale=1.0,
+            controlnet_conditioning_scale=infusenet_conditioning_scale,
+            control_guidance_start=infusenet_guidance_start,
+            control_guidance_end=infusenet_guidance_end,
+            height=height,
+            width=width,
+            cpu_offload=cpu_offload,
+        ).images[0]
+
+        return image
+
+    def call_with_embedding(
+        self,
+        id_image: Image.Image,  # Still needed for pipeline compatibility
+        id_embed: torch.Tensor,  # Precomputed ArcFace embedding [512]
+        prompt: str,
+        control_image: Optional[Image.Image] = None,
+        width=864,
+        height=1152,
+        seed=42,
+        guidance_scale=3.5,
+        num_steps=30,
+        infusenet_conditioning_scale=1.0,
+        infusenet_guidance_start=0.0,
+        infusenet_guidance_end=1.0,
+        cpu_offload=False,
+    ):
+        logger.info('Generating image with precomputed embedding')
+        seed_everything(seed)
+
+        # Prepare embedding
+        id_embed = id_embed.clone().unsqueeze(0).float().cuda()
+        id_embed = id_embed.reshape([1, -1, 512])
+        id_embed = id_embed.to(device='cuda', dtype=torch.bfloat16)
+        self.image_proj_model.to('cuda', torch.bfloat16)
+        with torch.no_grad():
+            id_embed = self.image_proj_model(id_embed)
+            bs_embed, seq_len, _ = id_embed.shape
+            id_embed = id_embed.repeat(1, 1, 1)
+            id_embed = id_embed.view(bs_embed * 1, seq_len, -1)
+            id_embed = id_embed.to(device='cuda', dtype=torch.bfloat16)
+        self.image_proj_model.cpu()
+        torch.cuda.empty_cache()
+
+        # Load control image
+        logger.info('Preparing the control image')
+        if control_image is not None:
+            control_image = control_image.convert("RGB")
+            control_image = resize_and_pad_image(control_image, (width, height))
+            face_info = self._detect_face(cv2.cvtColor(np.array(control_image), cv2.COLOR_RGB2BGR))
+            if len(face_info) == 0:
+                raise ValueError('No face detected in the control image')
+            face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1]
+            control_image = draw_kps(control_image, face_info['kps'])
+        else:
+            out_img = np.zeros([height, width, 3])
+            control_image = Image.fromarray(out_img.astype(np.uint8))
+
+        # Perform inference
+        logger.info('Generating image')
         image = self.pipe(
             prompt=prompt,
             controlnet_prompt_embeds=id_embed,
