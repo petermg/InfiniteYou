@@ -19,27 +19,40 @@ import logging
 import glob
 import re
 import json
-
+import tempfile
+import requests
+from PIL import Image, PngImagePlugin
+import numpy as np
 import gradio as gr
 import pillow_avif
-import torch
 from huggingface_hub import snapshot_download
 from pillow_heif import register_heif_opener
 from safetensors.torch import load_file
-from PIL import PngImagePlugin
-
+import insightface
+from insightface.app import FaceAnalysis
+import cv2
+from scipy import ndimage
+import torch
 from pipelines.pipeline_infu_flux import InfUFluxPipeline
 
-# Set up logging to both file and console
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('app.log', mode='a'),
-        logging.StreamHandler()
-    ]
-)
+# Force reconfiguration of logging
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+def configure_logging(debug_to_log):
+    handlers = [logging.StreamHandler()]
+    if debug_to_log:
+        handlers.append(logging.FileHandler('app.log', mode='a', encoding='utf-8'))
+    
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=handlers,
+        force=True
+    )
+
 logger = logging.getLogger(__name__)
+logger.info("Starting InfiniteYou-FLUX Gradio Demo")
 
 # Parse command-line arguments
 def parse_args():
@@ -68,6 +81,7 @@ ENABLE_REALISM_DEFAULT = False
 QUANTIZE_8BIT_DEFAULT = True
 CPU_OFFLOAD_DEFAULT = True
 OUTPUT_DIR = "./results"
+INTERMEDIATE_DIR = "./results/intermediates"  # For debugging id_pil
 MAX_LORA_FIELDS = 5  # Maximum number of LoRA fields to display
 
 # Available built-in LoRAs
@@ -90,10 +104,15 @@ def download_models():
     global models_downloaded
     if not models_downloaded:
         logger.info("Downloading models...")
-        snapshot_download(repo_id='ByteDance/InfiniteYou', local_dir='./models/InfiniteYou', local_dir_use_symlinks=False)
         try:
-             # snapshot_download(repo_id='black-forest-labs/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
+            snapshot_download(repo_id='ByteDance/InfiniteYou', local_dir='./models/InfiniteYou', local_dir_use_symlinks=False)
+            logger.info("Downloaded InfiniteYou model")
+        except Exception as e:
+            logger.error(f"Failed to download InfiniteYou: {e}")
+            raise
+        try:
             snapshot_download(repo_id='ChuckMcSneed/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
+            logger.info("Downloaded FLUX.1-dev model")
         except Exception as e:
             logger.error(f"Failed to download FLUX.1-dev: {e}")
             print('\nYou are downloading `black-forest-labs/FLUX.1-dev` to `./models/FLUX.1-dev` but failed. '
@@ -111,10 +130,367 @@ def download_models():
         models_downloaded = True
         logger.info("Models and LoRAs downloaded successfully.")
 
-def prepare_pipeline(model_version, loras, quantize_8bit, cpu_offload):
-    logger.info(f"Preparing pipeline with model_version={model_version}, loras={loras}, quantize_8bit={quantize_8bit}, cpu_offload={cpu_offload}")
+def download_arcface_models(model_dir="C:\\Users\\pgomb\\.insightface\\models\\arcface"):
+    """Download ArcFace models if not present."""
+    os.makedirs(model_dir, exist_ok=True)
+    models = [
+        {"url": "https://huggingface.co/maze/faceX/resolve/main/w600k_r50.onnx", "name": "w600k_r50.onnx"},
+        {"url": "https://huggingface.co/maze/faceX/resolve/main/det_10g.onnx", "name": "det_10g.onnx"}
+    ]
+    for model in models:
+        model_path = os.path.join(model_dir, model["name"])
+        if not os.path.exists(model_path):
+            logger.info(f"Downloading {model['name']} to {model_path}")
+            try:
+                response = requests.get(model['url'], stream=True)
+                response.raise_for_status()
+                with open(model_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                logger.info(f"Successfully downloaded {model['name']}")
+            except Exception as e:
+                logger.error(f"Failed to download {model['name']}: {str(e)}")
+                raise
+        else:
+            logger.debug(f"Model {model['name']} already exists at {model_path}")
+
+def preprocess_image(img: Image.Image, target_size: tuple = (640, 640)) -> np.ndarray:
+    """Preprocess image for ArcFace input with normalization."""
+    try:
+        # Convert to RGB and resize while maintaining aspect ratio
+        img = img.convert('RGB')
+        img_np = np.array(img)
+        h, w = img_np.shape[:2]
+        scale = min(target_size[0] / h, target_size[1] / w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        img_resized = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Pad to target size
+        padded_img = np.zeros((target_size[0], target_size[1], 3), dtype=np.uint8)
+        pad_h = (target_size[0] - new_h) // 2
+        pad_w = (target_size[1] - new_w) // 2
+        padded_img[pad_h:pad_h + new_h, pad_w:pad_w + new_w] = img_resized
+        
+        # Normalize pixel values to [0, 1] and standardize
+        padded_img = padded_img.astype(np.float32) / 255.0
+        padded_img = (padded_img - 0.5) / 0.5  # Standardize to [-1, 1]
+        
+        # Convert to BGR for insightface
+        img_bgr = cv2.cvtColor(padded_img, cv2.COLOR_RGB2BGR)
+        logger.debug(f"Preprocessed image shape: {img_bgr.shape}, mean: {np.mean(img_bgr):.3f}, std: {np.std(img_bgr):.3f}")
+        return img_bgr
+    except Exception as e:
+        logger.error(f"Failed to preprocess image: {str(e)}")
+        return None
+
+def align_face(img_array: np.ndarray, face) -> np.ndarray:
+    """Align face based on landmarks."""
+    try:
+        landmarks = face.landmark_2d_106
+        # Use eye landmarks (e.g., indices 35 and 104 for left and right eyes)
+        left_eye = landmarks[35]
+        right_eye = landmarks[104]
+        dy = right_eye[1] - left_eye[1]
+        dx = right_eye[0] - left_eye[0]
+        angle = np.degrees(np.arctan2(dy, dx))
+        
+        # Compute center of eyes
+        center = ((left_eye[0] + right_eye[0]) / 2, (left_eye[1] + right_eye[1]) / 2)
+        
+        # Rotate image
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        aligned_img = cv2.warpAffine(img_array, M, (img_array.shape[1], img_array.shape[0]))
+        
+        logger.debug(f"Aligned face with angle: {angle:.2f} degrees")
+        return aligned_img
+    except Exception as e:
+        logger.error(f"Failed to align face: {str(e)}")
+        return img_array
+
+def extract_arcface_embedding(image_path, det_size=(640, 640)):
+    """Extract ArcFace embedding for a single image using insightface."""
+    logger.debug(f"Extracting ArcFace embedding for {image_path}")
+    try:
+        # Verify model files
+        download_arcface_models()
+        
+        # Initialize FaceAnalysis
+        app = FaceAnalysis(name='arcface', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        app.prepare(ctx_id=0, det_size=det_size, det_thresh=0.03)
+        
+        # Load and preprocess image
+        img = Image.open(image_path)
+        img_array = preprocess_image(img, det_size)
+        if img_array is None:
+            logger.warning(f"Failed to preprocess image {image_path}")
+            return None
+        
+        # Detect faces
+        faces = app.get(img_array)
+        if not faces:
+            logger.warning(f"No face detected for embedding in {image_path}")
+            return None
+        
+        # Align face
+        img_array = align_face(img_array, faces[0])
+        
+        # Re-detect face on aligned image
+        faces = app.get(img_array)
+        if not faces:
+            logger.warning(f"No face detected after alignment in {image_path}")
+            return None
+        
+        # Extract embedding
+        embedding = faces[0].embedding
+        if embedding is None:
+            logger.error(f"Embedding is None for {image_path}, det_score: {faces[0].det_score}")
+            return None
+        
+        # Verify embedding
+        if not isinstance(embedding, np.ndarray) or embedding.size == 0:
+            logger.error(f"Invalid embedding for {image_path}: {embedding}")
+            return None
+        
+        logger.debug(f"Embedding shape: {embedding.shape}, norm: {np.linalg.norm(embedding)}")
+        logger.info(f"Extracted embedding for {image_path}")
+        return embedding
+    except Exception as e:
+        logger.error(f"Failed to extract embedding for {image_path}: {str(e)}")
+        return None
+
+def align_and_average_faces(id_images, det_size=(640, 640)):
+    """Align faces based on landmarks and average them pixel-wise."""
+    logger.info("Starting face alignment and averaging for provided images")
+    app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    app.prepare(ctx_id=0, det_size=det_size)
     
-    # Force reload if LoRAs differ to ensure they are applied
+    aligned_images = []
+    valid_image_paths = []
+    
+    # Detect landmarks for all images
+    landmarks_list = []
+    for id_image in id_images:
+        try:
+            if isinstance(id_image, dict) and 'path' in id_image:
+                image_path = id_image['path']
+            else:
+                image_path = id_image
+            logger.debug(f"Processing image for landmarks: {image_path}")
+            img = Image.open(image_path).convert('RGB')
+            img_array = np.array(img)
+            faces = app.get(img_array)
+            
+            if not faces:
+                logger.warning(f"No face detected in {image_path}")
+                continue
+                
+            landmarks = faces[0].landmark_2d_106
+            landmarks_list.append(landmarks)
+            aligned_images.append(img_array)
+            valid_image_paths.append(image_path)
+            logger.info(f"Landmarks detected in {image_path}")
+        except Exception as e:
+            logger.error(f"Failed to process image {image_path}: {e}")
+            continue
+    
+    if not landmarks_list:
+        logger.error("No valid faces detected for alignment")
+        raise ValueError("No valid faces detected for alignment")
+    
+    # Choose reference landmarks (first image)
+    ref_landmarks = landmarks_list[0]
+    ref_image_shape = aligned_images[0].shape[:2]
+    
+    # Align images to reference
+    aligned_arrays = []
+    for i, (landmarks, img_array) in enumerate(zip(landmarks_list, aligned_images)):
+        try:
+            src_points = np.array([
+                landmarks[33],  # Left eye
+                landmarks[88],  # Right eye
+                landmarks[55],  # Nose tip
+            ], dtype=np.float32)
+            dst_points = np.array([
+                ref_landmarks[33],
+                ref_landmarks[88],
+                ref_landmarks[55],
+            ], dtype=np.float32)
+            
+            M, _ = cv2.estimateAffinePartial2D(src_points, dst_points)
+            if M is None:
+                logger.warning(f"Failed to compute affine transform for {valid_image_paths[i]}")
+                continue
+                
+            aligned_array = cv2.warpAffine(
+                img_array,
+                M,
+                (ref_image_shape[1], ref_image_shape[0]),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE
+            )
+            aligned_arrays.append(aligned_array)
+            logger.info(f"Aligned image {valid_image_paths[i]}")
+        except Exception as e:
+            logger.error(f"Failed to align image {valid_image_paths[i]}: {e}")
+            continue
+    
+    if not aligned_arrays:
+        logger.error("No images aligned successfully")
+        raise ValueError("No images aligned successfully")
+    
+    # Average aligned images
+    try:
+        aligned_arrays = [arr.astype(np.float32) for arr in aligned_arrays]
+        averaged_array = np.mean(aligned_arrays, axis=0)
+        averaged_array = np.clip(averaged_array, 0, 255).astype(np.uint8)
+        averaged_image = Image.fromarray(averaged_array)
+        logger.info(f"Averaged {len(aligned_arrays)} images into composite")
+        return averaged_image
+    except Exception as e:
+        logger.error(f"Failed to average images: {e}")
+        raise ValueError(f"Failed to average images: {str(e)}")
+
+def select_best_face_image(id_images, mode="best_face", det_size=(640, 640)):
+    """Select the best face, average aligned faces, or average embeddings based on mode."""
+    logger.info(f"Selecting face image with raw mode: {mode}")
+    
+    # Validate mode
+    valid_modes = ["best_face", "averaged_face", "averaged_embedding"]
+    if mode not in valid_modes:
+        logger.warning(f"Invalid mode '{mode}', defaulting to 'best_face'")
+        mode = "best_face"
+    logger.debug(f"Normalized mode: {mode}")
+    
+    # Normalize id_images to list of paths
+    image_paths = []
+    for id_image in id_images:
+        path = id_image['path'] if isinstance(id_image, dict) and 'path' in id_image else id_image
+        image_paths.append(path)
+    logger.debug(f"Input image paths: {image_paths}, count: {len(image_paths)}")
+    
+    if mode == "averaged_face":
+        try:
+            result = align_and_average_faces(id_images, det_size)
+            # Save intermediate for debugging
+            os.makedirs(INTERMEDIATE_DIR, exist_ok=True)
+            out_path = os.path.join(INTERMEDIATE_DIR, f"averaged_face_{time}.png")
+            result.save(out_path)
+            logger.info(f"Saved averaged face to {out_path}")
+            return result
+        except Exception as e:
+            logger.error(f"Averaged face processing failed: {str(e)}, falling back to best_face")
+            mode = "best_face"
+    
+    if mode == "averaged_embedding":
+        logger.info("Starting embedding averaging for face selection")
+        embeddings = []
+        valid_images = []
+        valid_image_paths = []
+        
+        try:
+            for id_image in id_images:
+                if isinstance(id_image, dict) and 'path' in id_image:
+                    image_path = id_image['path']
+                else:
+                    image_path = id_image
+                logger.debug(f"Processing embedding for {image_path}")
+                embedding = extract_arcface_embedding(image_path, det_size)
+                if embedding is not None:
+                    embeddings.append(embedding)
+                    valid_images.append(Image.open(image_path).convert('RGB'))
+                    valid_image_paths.append(image_path)
+                    logger.info(f"Embedding extracted for {image_path}, shape: {embedding.shape}")
+                else:
+                    logger.warning(f"No embedding extracted for {image_path}")
+            
+            logger.debug(f"Extracted {len(embeddings)} valid embeddings")
+            if not embeddings:
+                logger.error("No valid embeddings extracted")
+                raise ValueError("No valid embeddings extracted")
+            
+            # Average embeddings
+            avg_embedding = np.mean(embeddings, axis=0)
+            logger.debug(f"Average embedding shape: {avg_embedding.shape}, norm: {np.linalg.norm(avg_embedding)}")
+            avg_embedding = avg_embedding / np.linalg.norm(avg_embedding)  # Normalize
+            logger.debug(f"Normalized average embedding norm: {np.linalg.norm(avg_embedding)}")
+            
+            # Find closest image to averaged embedding
+            best_image = None
+            best_score = -1
+            best_image_path = None
+            
+            for img, emb, path in zip(valid_images, embeddings, valid_image_paths):
+                score = np.dot(emb, avg_embedding)
+                logger.debug(f"Similarity score for {path}: {score}")
+                if score > best_score:
+                    best_score = score
+                    best_image = img
+                    best_image_path = path
+            
+            if best_image is None:
+                logger.error("No image selected after embedding comparison")
+                raise ValueError("No image selected after embedding comparison")
+                
+            logger.info(f"Selected image with closest embedding: {best_image_path} (score: {best_score})")
+            # Save intermediate for debugging
+            os.makedirs(INTERMEDIATE_DIR, exist_ok=True)
+            out_path = os.path.join(INTERMEDIATE_DIR, f"averaged_embedding_{time}.png")
+            best_image.save(out_path)
+            logger.info(f"Saved averaged embedding image to {out_path}")
+            return best_image
+        except Exception as e:
+            logger.error(f"Averaged embedding Foundation Seriesprocessing failed: {str(e)}, falling back to best_face")
+            mode = "best_face"
+    
+    # Best face selection
+    logger.info("Starting face detection for best face selection")
+    app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    app.prepare(ctx_id=0, det_size=det_size)
+    
+    best_image = None
+    best_confidence = -1
+    best_image_path = None
+    
+    for id_image in id_images:
+        try:
+            if isinstance(id_image, dict) and 'path' in id_image:
+                image_path = id_image['path']
+            else:
+                image_path = id_image
+            logger.debug(f"Processing image: {image_path}")
+            img = Image.open(image_path).convert('RGB')
+            img_array = np.array(img)
+            faces = app.get(img_array)
+            
+            if faces:
+                confidence = faces[0].det_score
+                logger.info(f"Image {image_path}: Face detected with confidence {confidence}")
+                if confidence > best_confidence:
+                    best_confidence = confidence
+                    best_image = img
+                    best_image_path = image_path
+            else:
+                logger.warning(f"No face detected in {image_path}")
+        except Exception as e:
+            logger.error(f"Failed to process image {image_path}: {str(e)}")
+            continue
+    
+    if best_image is None:
+        logger.error("No valid face detected in any provided images")
+        raise ValueError("No valid face detected in any provided images")
+    
+    logger.info(f"Selected best image: {best_image_path} with confidence {best_confidence}")
+    # Save intermediate for debugging
+    os.makedirs(INTERMEDIATE_DIR, exist_ok=True)
+    out_path = os.path.join(INTERMEDIATE_DIR, f"best_face_{time}.png")
+    best_image.save(out_path)
+    logger.info(f"Saved best face image to {out_path}")
+    return best_image
+
+def prepare_pipeline(model_version, loras, quantize_8bit, cpu_offload, debug_to_log):
+    logger.info(f"Preparing pipeline with model_version={model_version}, loras={loras}, debug_to_log={debug_to_log}")
+    
     if (
         loaded_pipeline_config['pipeline'] is not None
         and loaded_pipeline_config["loras"] == loras
@@ -122,7 +498,7 @@ def prepare_pipeline(model_version, loras, quantize_8bit, cpu_offload):
         and loaded_pipeline_config["cpu_offload"] == cpu_offload
         and model_version == loaded_pipeline_config["model_version"]
     ):
-        logger.info("Reusing existing pipeline.")
+        logger.info("Reusing existing pipeline")
         return loaded_pipeline_config['pipeline']
     
     loaded_pipeline_config["loras"] = loras
@@ -132,40 +508,44 @@ def prepare_pipeline(model_version, loras, quantize_8bit, cpu_offload):
 
     pipeline = loaded_pipeline_config['pipeline']
     if pipeline is None or pipeline.model_version != model_version:
-        logger.info(f'Switching model to {model_version}')
+        logger.info(f"Switching to model: {model_version}")
         if pipeline is not None:
-            logger.info("Deleting existing pipeline.")
+            logger.debug("Deleting existing pipeline")
             del pipeline
             del loaded_pipeline_config['pipeline']
             gc.collect()
             torch.cuda.empty_cache()
 
         model_path = f'./models/InfiniteYou/infu_flux_v1.0/{model_version}'
-        logger.info(f'Loading model from {model_path}')
+        logger.debug(f'Loading model from {model_path}')
 
-        pipeline = InfUFluxPipeline(
-            base_model_path='./models/FLUX.1-dev',
-            infu_model_path=model_path,
-            insightface_root_path='./models/InfiniteYou/supports/insightface',
-            image_proj_num_tokens=8,
-            infu_flux_version='v1.0',
-            model_version=model_version,
-            quantize_8bit=quantize_8bit,
-            cpu_offload=cpu_offload,
-        )
+        try:
+            pipeline = InfUFluxPipeline(
+                base_model_path='./models/FLUX.1-dev',
+                infu_model_path=model_path,
+                insightface_root_path='./models/InfiniteYou/supports/insightface',
+                image_proj_num_tokens=8,
+                infu_flux_version='v1.0',
+                model_version=model_version,
+                quantize_8bit=quantize_8bit,
+                cpu_offload=cpu_offload,
+                debug_to_log=debug_to_log
+            )
+            logger.info("Pipeline initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize pipeline: {e}")
+            raise
 
         loaded_pipeline_config['pipeline'] = pipeline
 
-    # Unload previous LoRA weights
     try:
         pipeline.pipe.unload_lora_weights()
-        logger.info("Unloaded previous LoRA weights.")
+        logger.debug("Unloaded previous LoRA weights")
     except Exception as e:
         logger.error(f"Failed to unload LoRA weights: {e}")
 
-    # Load new LoRAs
     if loras:
-        logger.info(f"Loading LoRAs: {loras}")
+        logger.debug(f"Loading LoRAs: {loras}")
         for lora in loras:
             lora_path = lora[0]
             if not os.path.exists(lora_path):
@@ -176,15 +556,16 @@ def prepare_pipeline(model_version, loras, quantize_8bit, cpu_offload):
                 raise ValueError(f"LoRA file must be a .safetensors file: {lora_path}")
         try:
             pipeline.load_loras(loras)
-            logger.info("LoRAs loaded successfully.")
+            logger.debug("LoRAs loaded")
         except Exception as e:
             logger.error(f"Failed to load LoRAs: {e}")
             raise RuntimeError(f"Failed to load LoRAs: {e}")
 
+    logger.info("Pipeline preparation complete")
     return pipeline
 
 def generate_image(
-    input_image, 
+    id_images, 
     control_image, 
     prompt, 
     seed, 
@@ -199,50 +580,103 @@ def generate_image(
     quantize_8bit,
     cpu_offload,
     model_version,
-    num_images
+    num_images,
+    face_selection_mode,
+    debug_to_log
 ):
-    # Convert lora_state to loras format
+    logger.info("Generate button clicked: Entering generate_image")
+    logger.debug(f"Raw inputs: id_images={type(id_images)}, prompt={prompt}, seed={seed}, num_images={num_images}, face_selection_mode={face_selection_mode}, debug_to_log={debug_to_log}")
+    
+    # Reconfigure logging based on debug_to_log
+    configure_logging(debug_to_log)
+    
+    # Log raw face_selection_mode
+    logger.info(f"Raw face selection mode from UI: {face_selection_mode}")
+    
+    # Normalize id_images to a list
+    logger.debug("Normalizing id_images")
+    if id_images is None:
+        id_images = []
+    elif isinstance(id_images, dict):
+        id_images = [id_images]
+    elif not isinstance(id_images, list):
+        id_images = [id_images]
+    
+    logger.debug(f"Normalized id_images: {[img['path'] if isinstance(img, dict) else img for img in id_images]}")
+
+    # Validate inputs
+    if not id_images:
+        logger.warning("No identity images provided")
+        gr.Error("Please upload at least one identity image")
+        return gr.update(), ""
+    
     loras = convert_lora_state_to_loras(lora_state)
-    logger.info(f"Converted lora_state to loras: {loras}")
+    logger.debug(f"LoRAs: {loras}")
 
-    # Download models if not already done
-    download_models()
+    logger.debug("Checking model download")
+    try:
+        download_models()
+        logger.debug("Models downloaded")
+    except Exception as e:
+        logger.error(f"Model download failed: {e}")
+        gr.Error(f"Model download failed: {str(e)}")
+        return gr.update(), ""
 
-    # Prepare pipeline with user-selected options
-    pipeline = prepare_pipeline(
-        model_version=model_version,
-        loras=loras,
-        quantize_8bit=quantize_8bit,
-        cpu_offload=cpu_offload
-    )
+    logger.debug("Preparing pipeline")
+    try:
+        pipeline = prepare_pipeline(
+            model_version=model_version,
+            loras=loras,
+            quantize_8bit=quantize_8bit,
+            cpu_offload=cpu_offload,
+            debug_to_log=debug_to_log
+        )
+        logger.debug("Pipeline ready")
+    except Exception as e:
+        logger.error(f"Pipeline preparation failed: {e}")
+        gr.Error(f"Pipeline preparation failed: {str(e)}")
+        return gr.update(), ""
 
-    # Ensure num_images is a positive integer
+    logger.debug("Processing num_images")
     try:
         num_images = int(num_images)
         if num_images < 1:
             num_images = 1
     except (ValueError, TypeError):
         num_images = 1
-    logger.info(f"Generating {num_images} images")
+    logger.debug(f"Number of images to generate: {num_images}")
+
+    logger.debug("Selecting face image")
+    try:
+        id_pil = select_best_face_image(id_images, mode=face_selection_mode.lower())
+        logger.debug(f"Selected face with mode: {face_selection_mode}")
+    except ValueError as e:
+        logger.error(f"Face selection error: {e}")
+        gr.Error(str(e))
+        return gr.update(), ""
+    except Exception as e:
+        logger.error(f"Unexpected face selection error: {e}")
+        gr.Error(f"Unexpected face selection error: {str(e)}")
+        return gr.update(), ""
 
     images = []
     seeds = []
     base_seed = seed
 
+    logger.debug("Starting image generation loop")
     for i in range(num_images):
-        # Generate a unique seed for each image if seed is 0 (random)
         current_seed = base_seed
         if current_seed == 0:
             current_seed = torch.seed() & 0xFFFFFFFF
-            logger.info(f"Generated random seed for image {i+1}: {current_seed}")
+            logger.debug(f"Random seed for image {i+1}: {current_seed}")
         else:
-            # Increment seed for each image to ensure different results
             current_seed = base_seed + i
-            logger.info(f"Using seed for image {i+1}: {current_seed}")
+            logger.debug(f"Seed for image {i+1}: {current_seed}")
 
+        logger.debug(f"Generating image {i+1}")
         try:
             image = pipeline(
-                id_image=input_image,
+                id_image=id_pil,
                 prompt=prompt,
                 control_image=control_image,
                 seed=current_seed,
@@ -255,14 +689,18 @@ def generate_image(
                 infusenet_guidance_end=infusenet_guidance_end,
                 cpu_offload=cpu_offload,
             )
-            # Save the generated image with metadata
+            logger.debug(f"Image {i+1} generated")
+            if image is None:
+                logger.error(f"Pipeline returned None for image {i+1}")
+                gr.Error(f"Image generation failed: Pipeline returned None")
+                continue
+
             os.makedirs(OUTPUT_DIR, exist_ok=True)
             index = len(os.listdir(OUTPUT_DIR))
             prompt_name = ''.join(c if c.isalnum() or c in '_-' else '_' for c in prompt[:50].replace(' ', '_')).strip('_')
             out_name = f"{index:05d}_{prompt_name}_seed{current_seed}_time{time}_img{i+1}.png"
             out_path = os.path.join(OUTPUT_DIR, out_name)
 
-            # Create metadata dictionary
             metadata = {
                 "prompt": prompt,
                 "loras": [
@@ -270,7 +708,7 @@ def generate_image(
                         "name": lora["name"],
                         "path": lora["path"],
                         "weight": lora["weight"]
-                    } for lora in lora_state if lora["name"] != "None" and lora["path"]
+                    } for lora in lora_state if lora["name"] != "None" and lora.get("path", "")
                 ],
                 "model_version": model_version,
                 "guidance_scale": guidance_scale,
@@ -283,327 +721,201 @@ def generate_image(
                 "infusenet_guidance_end": infusenet_guidance_end,
                 "quantize_8bit": quantize_8bit,
                 "cpu_offload": cpu_offload,
-                "image_number": i + 1
+                "num_input_images": len(id_images),
+                "face_selection_mode": face_selection_mode,
+                "debug_to_log": debug_to_log
             }
 
-            # Convert metadata to JSON string
             metadata_json = json.dumps(metadata, indent=2)
-
-            # Create PngInfo object for metadata
             png_info = PngImagePlugin.PngInfo()
             png_info.add_text("parameters", metadata_json)
 
-            # Save image with metadata
             image.save(out_path, pnginfo=png_info)
-            logger.info(f"Image {i+1} saved to {out_path} with metadata: {metadata_json}")
+            logger.info(f"Image {i+1} saved to {out_path}")
             images.append(image)
             seeds.append(str(current_seed))
         except Exception as e:
-            logger.error(f"Error during image {i+1} generation: {e}")
-            gr.Error(f"An error occurred during image {i+1} generation: {e}")
+            logger.error(f"Error generating image {i+1}: {e}")
+            gr.Error(f"Error generating image {i+1}: {str(e)}")
             continue
 
     if not images:
+        logger.error("No images generated")
+        gr.Error("No images were generated")
         return gr.update(), ",".join(seeds)
+
+    logger.info(f"Generated {len(images)} images with seeds: {seeds}")
     return gr.update(value=images, label=f"Generated Images, seeds={','.join(seeds)}, saved to {OUTPUT_DIR}"), ",".join(seeds)
 
-def generate_examples(id_image, control_image, prompt_text, seed, lora_state, model_version):
-    # Convert lora_state to loras format
+def generate_examples(id_images, control_image, prompt_text, seed, lora_state, model_version, face_selection_mode="best_face", debug_to_log=False):
     loras = convert_lora_state_to_loras(lora_state)
-    logger.info(f"Generating example with loras: {loras}")
-    # Use default values for quantize_8bit, cpu_offload, and num_images=1 for examples
+    logger.debug(f"Generating example with loras={loras}, face_selection_mode={face_selection_mode}, debug_to_log={debug_to_log}")
+    configure_logging(debug_to_log)
     result, last_seed = generate_image(
-        id_image, control_image, prompt_text, seed, 864, 1152, 3.5, 30, 1.0, 0.0, 1.0,
-        lora_state, QUANTIZE_8BIT_DEFAULT, CPU_OFFLOAD_DEFAULT, model_version, num_images=1
+        id_images, control_image, prompt_text, seed, 864, 1152, 3.5, 30, 1.0, 0.0, 1.0,
+        lora_state, QUANTIZE_8BIT_DEFAULT, CPU_OFFLOAD_DEFAULT, model_version, num_images=1,
+        face_selection_mode=face_selection_mode,
+        debug_to_log=debug_to_log
     )
-    # Since generate_image returns a list, extract the first image for examples
     images = result.value if isinstance(result.value, list) else [result.value] if result.value else []
     return gr.update(value=images, label=f"Generated Example, seed={last_seed}"), last_seed
 
 def convert_lora_state_to_loras(lora_state):
     loras = []
     for lora in lora_state:
-        if lora["name"] != "None" and lora["path"]:
-            # Ensure weight is a float
+        if lora["name"] != "None" and lora.get("path", ""):
             try:
                 weight = float(lora["weight"])
             except (ValueError, TypeError):
                 logger.warning(f"Invalid weight {lora['weight']} for LoRA {lora['name']}, defaulting to 1.5")
                 weight = 1.5
             loras.append([lora["path"], lora["name"], weight])
-    logger.debug(f"Converted lora_state: {lora_state} to loras: {loras}")
+    logger.debug(f"Converted lora_state to loras: {loras}")
     return loras
 
 def read_safetensors_header(file_path):
-    """Read the header of a safetensors file and attempt to parse JSON metadata."""
     try:
         with open(file_path, 'rb') as f:
-            # Read the first 8 bytes to get the header length
             header_len_bytes = f.read(8)
             if len(header_len_bytes) != 8:
                 logger.warning(f"Failed to read header length from {file_path}")
                 return {}
             header_len = int.from_bytes(header_len_bytes, byteorder='little')
-            # Read the header data
             header_data = f.read(header_len)
             if len(header_data) != header_len:
-                logger.warning(f"Incomplete header read from {file_path}: expected {header_len}, got {len(header_data)}")
+                logger.warning(f"Incomplete header read from {file_path}")
                 return {}
-            # Try decoding as UTF-8, replacing invalid characters
-            try:
-                header_str = header_data.decode('utf-8')
-            except UnicodeDecodeError:
-                header_str = header_data.decode('utf-8', errors='replace')
-            logger.debug(f"Raw header from {file_path}: {header_str[:1000]}...")
-            # Parse JSON
-            try:
-                header_json = json.loads(header_str)
-                metadata = header_json.get("__metadata__", {})
-                if not isinstance(metadata, dict):
-                    logger.warning(f"Metadata in {file_path} is not a dictionary: {metadata}")
-                    metadata = {"raw_metadata": str(metadata)}
-                metadata = {k: str(v) for k, v in metadata.items()}
-                logger.info(f"Parsed metadata from header in {file_path}: {metadata}")
-                return metadata
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse JSON header in {file_path}: {e}")
-                return {}
+            header_str = header_data.decode('utf-8')
+            header_json = json.loads(header_str)
+            metadata = header_json.get("__metadata__", {})
+            metadata = {k: str(v) for k, v in metadata.items()}
+            logger.debug(f"Read metadata from {file_path}: {metadata}")
+            return metadata
     except Exception as e:
         logger.error(f"Error reading safetensors header from {file_path}: {e}")
         return {}
 
 def list_lora_files(directory):
-    """Scan the specified directory for .safetensors files and return their filenames, full paths, and metadata."""
-    logger.info(f"Listing LoRA files in directory: {directory}")
+    logger.debug(f"Listing LoRA files in {directory}")
     if not directory:
-        logger.warning("No LoRA directory specified, returning empty list")
         return []
-    try:
-        safetensors_files = glob.glob(os.path.join(directory, "*.safetensors"))
-        lora_list = []
-        for f in safetensors_files:
-            try:
-                # First attempt to load metadata using safetensors.torch
-                safetensors_data = load_file(f, device="cpu")
-                file_keys = list(safetensors_data.keys())
-                logger.debug(f"Keys in {f}: {file_keys}")
-                
-                # Try standard __metadata__ key
-                metadata = safetensors_data.get("__metadata__", {})
-                if not metadata:
-                    # Check for alternative metadata keys
-                    for key in file_keys:
-                        if "metadata" in key.lower() or "info" in key.lower():
-                            try:
-                                metadata = safetensors_data[key]
-                                if isinstance(metadata, str):
-                                    metadata = json.loads(metadata)
-                                logger.debug(f"Found metadata in key {key}: {metadata}")
-                                break
-                            except Exception as e:
-                                logger.warning(f"Failed to parse metadata from key {key} in {f}: {e}")
-                
-                # If no metadata found, try reading the header directly
-                if not metadata:
-                    logger.info(f"No metadata found via load_file for {f}, attempting header read")
-                    metadata = read_safetensors_header(f)
-                
-                # Ensure metadata is a dictionary and serializable
-                if not isinstance(metadata, dict):
-                    logger.warning(f"Metadata in {f} is not a dictionary: {metadata}")
-                    metadata = {"raw_metadata": str(metadata)}
-                metadata = {k: str(v) for k, v in metadata.items()}
-                
-                logger.info(f"Metadata for {f}: {metadata}")
-                lora_list.append([os.path.basename(f), f, metadata])
-            except Exception as e:
-                logger.warning(f"Failed to load metadata for {f}: {e}")
-                lora_list.append([os.path.basename(f), f, {}])
-        logger.info(f"Found LoRA files with metadata: {lora_list}")
-        return lora_list
-    except Exception as e:
-        logger.error(f"Error listing LoRA files in {directory}: {e}")
-        return []
+    safetensors_files = glob.glob(os.path.join(directory, "*.safetensors"))
+    lora_list = []
+    for f in safetensors_files:
+        try:
+            metadata = read_safetensors_header(f)
+            lora_list.append([os.path.basename(f), f, metadata])
+        except Exception as e:
+            logger.warning(f"Failed to read metadata for {f}: {e}")
+            lora_list.append([os.path.basename(f), f, {}])
+    logger.debug(f"Found LoRA files: {lora_list}")
+    return lora_list
 
 def update_lora_fields(lora_list, last_valid_lora_state):
-    """Update visibility and values of LoRA fields and their rows based on lora_list."""
-    logger.debug(f"update_lora_fields called with lora_list: {lora_list}, last_valid_lora_state: {last_valid_lora_state}")
+    logger.debug(f"Updating LoRA fields with lora_list={lora_list}")
     updates = []
     valid_choices = ["None"] + list(AVAILABLE_LORAS.keys())
-    # Ensure at least one LoRA field is visible
     if not lora_list:
-        logger.warning("lora_list is empty, restoring last_valid_lora_state")
-        lora_list = last_valid_lora_state
-        if not lora_list:
-            lora_list = [{"name": "None", "path": "", "weight": 1.5, "metadata": {}}]
+        lora_list = last_valid_lora_state or [{"name": "None", "path": "", "weight": 1.5, "metadata": {}}]
     for i in range(MAX_LORA_FIELDS):
         if i < len(lora_list):
             lora = lora_list[i]
             display_name = lora["name"].split('_')[0] if lora["name"] != "None" and '_' in lora["name"] else lora["name"]
-            if display_name not in valid_choices and not lora["path"]:
-                logger.warning(f"Invalid LoRA name {display_name} in lora_list at index {i}, defaulting to 'None'")
+            if display_name not in valid_choices and not lora.get("path", ""):
                 display_name = "None"
-            path = lora["path"]
-            try:
-                weight = float(lora["weight"])
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid weight {lora['weight']} for LoRA {lora['name']}, defaulting to 1.5")
-                weight = 1.5
+            path = lora.get("path", "")
+            weight = float(lora["weight"]) if lora.get("weight") else 1.5
             metadata = lora.get("metadata", {})
-            metadata_display = "\n".join([f"{k}: {v}" for k, v in metadata.items()]) if metadata else "No metadata available"
+            metadata_display = "\n".join([f"{k}: {v}" for k, v in metadata.items()]) if metadata else "No metadata"
             visible = True
         else:
             display_name = "None"
             path = ""
             weight = 1.5
-            metadata_display = "No metadata available"
+            metadata_display = "No metadata"
             visible = False
         updates.extend([
-            gr.update(value=display_name, visible=visible),  # lora_name (dropdown)
-            gr.update(value=path, visible=visible and display_name not in valid_choices),  # lora_path (textbox)
-            gr.update(value=weight, visible=visible),  # lora_weight
-            gr.update(value=metadata_display, visible=visible),  # lora_metadata
-            gr.update(visible=visible),  # remove_btn
-            gr.update(visible=visible),  # row
+            gr.update(value=display_name, visible=visible),
+            gr.update(value=path, visible=visible and display_name not in valid_choices),
+            gr.update(value=weight, visible=visible),
+            gr.update(value=metadata_display, visible=visible),
+            gr.update(visible=visible),
+            gr.update(visible=visible),
         ])
-    logger.debug(f"Returning updates for lora_components: {updates}")
     return updates
 
 def add_lora(lora_list, last_valid_lora_state):
     if len(lora_list) < MAX_LORA_FIELDS:
         new_list = lora_list + [{"name": "None", "path": "", "weight": 1.5, "metadata": {}}]
-        logger.info(f"Added new LoRA. New lora_list: {new_list}")
-        return new_list, len(new_list) - 1, new_list  # Update last_valid_lora_state
-    logger.info("Maximum LoRA fields reached.")
+        logger.debug(f"Added LoRA: {new_list}")
+        return new_list, len(new_list) - 1, new_list
+    logger.info("Max LoRA fields reached")
     return lora_list, None, last_valid_lora_state
 
 def remove_lora(index, lora_list, last_valid_lora_state):
     if index < len(lora_list) and len(lora_list) > 1:
-        new_list = lora_list.copy()
-        new_list.pop(index)
-        logger.info(f"Removed LoRA at index {index}. New lora_list: {new_list}")
-        return new_list, min(index, len(new_list) - 1), new_list  # Update last_valid_lora_state
-    logger.warning(f"Cannot remove LoRA at index {index}. lora_list length: {len(lora_list)}")
+        new_list = lora_list[:index] + lora_list[index+1:]
+        logger.debug(f"Removed LoRA at index {index}: {new_list}")
+        return new_list, min(index, len(new_list) - 1), new_list
+    logger.warning("Cannot remove LoRA")
     return lora_list, index, last_valid_lora_state
 
 def sanitize_lora_name(name):
-    """Remove invalid characters from LoRA name to make it a valid PyTorch module name."""
     if not name or name == "None":
         return name
     clean_name = re.sub(r'\.safetensors$', '', name)
     clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', clean_name)
-    if clean_name and clean_name[0].isdigit():
+    if clean_name[0].isdigit():
         clean_name = f"lora_{clean_name}"
     logger.debug(f"Sanitized LoRA name: {name} -> {clean_name}")
     return clean_name
 
 def update_lora(index, name, path, weight, lora_list, metadata=None):
-    """Update a single LoRA entry in lora_list."""
-    logger.debug(f"update_lora called with index={index}, name={name}, path={path}, weight={weight}, lora_list={lora_list}, metadata={metadata}")
+    logger.debug(f"Updating LoRA {index}: name={name}, path={path}, weight={weight}")
     valid_choices = ["None"] + list(AVAILABLE_LORAS.keys())
     if name not in valid_choices and not path:
-        logger.warning(f"Invalid LoRA name '{name}' at index {index}, defaulting to 'None'")
         name = "None"
         path = ""
         metadata = {}
-    try:
-        weight = float(weight)
-    except (ValueError, TypeError):
-        logger.warning(f"Invalid weight '{weight}' at index {index}, defaulting to 1.5")
-        weight = 1.5
+    weight = float(weight) if weight else 1.5
     if path and not path.endswith('.safetensors'):
-        logger.warning(f"Invalid LoRA path '{path}' at index {index}, defaulting to 'None'")
         name = "None"
         path = ""
         metadata = {}
     elif name in AVAILABLE_LORAS:
         path = AVAILABLE_LORAS[name]
-        try:
-            safetensors_data = load_file(path, device="cpu")
-            file_keys = list(safetensors_data.keys())
-            logger.debug(f"Keys in built-in LoRA {path}: {file_keys}")
-            metadata = safetensors_data.get("__metadata__", {})
-            if not metadata:
-                for key in file_keys:
-                    if "metadata" in key.lower() or "info" in key.lower():
-                        try:
-                            metadata = safetensors_data[key]
-                            if isinstance(metadata, str):
-                                metadata = json.loads(metadata)
-                            logger.debug(f"Found metadata in key {key} for {path}: {metadata}")
-                            break
-                        except Exception as e:
-                            logger.warning(f"Failed to parse metadata from key {key} in {path}: {e}")
-                if not metadata:
-                    logger.info(f"No metadata found via load_file for {path}, attempting header read")
-                    metadata = read_safetensors_header(path)
-            metadata = {k: str(v) for k, v in metadata.items()}
-            logger.info(f"Metadata for built-in LoRA {path}: {metadata}")
-        except Exception as e:
-            logger.warning(f"Failed to load metadata for built-in LoRA {path}: {e}")
-            metadata = {}
+        metadata = read_safetensors_header(path)
 
     new_list = lora_list.copy()
     if index >= len(new_list):
         new_list.append({"name": "None", "path": "", "weight": 1.5, "metadata": {}})
-
     sanitized_name = sanitize_lora_name(name)
     unique_name = f"{sanitized_name}_{index}" if sanitized_name != "None" else "None"
     new_list[index] = {"name": unique_name, "path": path, "weight": weight, "metadata": metadata or {}}
-    
-    logger.info(f"Updated lora_list: {new_list}")
+    logger.debug(f"Updated lora_list: {new_list}")
     return new_list
 
 def update_lora_name(index, name, lora_list, last_valid_lora_state):
-    """Update LoRA name and path based on selection."""
-    logger.debug(f"update_lora_name called with index={index}, name={name}, lora_list={lora_list}")
+    logger.debug(f"Updating LoRA name at index {index} to {name}")
     if index >= len(lora_list):
         return lora_list, last_valid_lora_state
     current_lora = lora_list[index]
     if current_lora["name"].split('_')[0] == name:
         return lora_list, last_valid_lora_state
-    weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
+    weight = float(current_lora["weight"]) if current_lora.get("weight") else 1.5
     path = AVAILABLE_LORAS.get(name, "")
-    metadata = {}
-    if path:
-        try:
-            safetensors_data = load_file(path, device="cpu")
-            file_keys = list(safetensors_data.keys())
-            logger.debug(f"Keys in {path}: {file_keys}")
-            metadata = safetensors_data.get("__metadata__", {})
-            if not metadata:
-                for key in file_keys:
-                    if "metadata" in key.lower() or "info" in key.lower():
-                        try:
-                            metadata = safetensors_data[key]
-                            if isinstance(metadata, str):
-                                metadata = json.loads(metadata)
-                            logger.debug(f"Found metadata in key {key}: {metadata}")
-                            break
-                        except Exception as e:
-                            logger.warning(f"Failed to parse metadata from key {key} in {path}: {e}")
-                if not metadata:
-                    logger.info(f"No metadata found via load_file for {path}, attempting header read")
-                    metadata = read_safetensors_header(path)
-            metadata = {k: str(v) for k, v in metadata.items()}
-            logger.info(f"Metadata for {path}: {metadata}")
-        except Exception as e:
-            logger.warning(f"Failed to load metadata for {path}: {e}")
-            metadata = {}
+    metadata = read_safetensors_header(path) if path else {}
     new_list = update_lora(index, name, path, weight, lora_list, metadata)
-    return new_list, new_list  # Update last_valid_lora_state
+    return new_list, new_list
 
 def select_custom_lora(active_lora_index, lora_name, lora_list, custom_loras, last_valid_lora_state):
-    """Update lora_state with the selected custom LoRA for the specified index and reset dropdown."""
-    logger.debug(f"select_custom_lora called with active_lora_index={active_lora_index}, lora_name={lora_name}, lora_list={lora_list}, custom_loras={custom_loras}, last_valid_lora_state={last_valid_lora_state}")
+    logger.debug(f"Selecting custom LoRA: index={active_lora_index}, name={lora_name}")
     if active_lora_index is None or active_lora_index >= len(lora_list):
-        logger.warning(f"Invalid active_lora_index {active_lora_index}, no update performed")
         return lora_list, None, last_valid_lora_state
     if lora_name is None:
-        logger.debug("lora_name is None, skipping update to avoid resetting LoRA slot")
         return lora_list, None, last_valid_lora_state
     current_lora = lora_list[active_lora_index]
-    weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
+    weight = float(current_lora["weight"]) if current_lora.get("weight") else 1.5
     path = ""
     metadata = {}
     if lora_name:
@@ -614,93 +926,46 @@ def select_custom_lora(active_lora_index, lora_name, lora_list, custom_loras, la
                 break
     name = lora_name if path else "None"
     updated_list = update_lora(active_lora_index, name, path, weight, lora_list, metadata)
-    logger.debug(f"select_custom_lora returning updated_list: {updated_list}, custom_lora_select: None, last_valid_lora_state: {updated_list}")
-    return updated_list, None, updated_list  # Update last_valid_lora_state
+    return updated_list, None, updated_list
 
 def update_lora_path(index, path, lora_list, last_valid_lora_state):
-    """Update LoRA path manually entered by user."""
-    logger.debug(f"update_lora_path called with index={index}, path={path}, lora_list={lora_list}")
+    logger.debug(f"Updating LoRA path at index {index} to {path}")
     if index >= len(lora_list):
         return lora_list, last_valid_lora_state
     current_lora = lora_list[index]
-    name = os.path.basename(path) if path and isinstance(path, str) and path.endswith('.safetensors') else "None"
-    weight = float(current_lora["weight"]) if current_lora["weight"] else 1.5
-    metadata = {}
-    if path and isinstance(path, str) and path.endswith('.safetensors'):
-        try:
-            safetensors_data = load_file(path, device="cpu")
-            file_keys = list(safetensors_data.keys())
-            logger.debug(f"Keys in {path}: {file_keys}")
-            metadata = safetensors_data.get("__metadata__", {})
-            if not metadata:
-                for key in file_keys:
-                    if "metadata" in key.lower() or "info" in key.lower():
-                        try:
-                            metadata = safetensors_data[key]
-                            if isinstance(metadata, str):
-                                metadata = json.loads(metadata)
-                            logger.debug(f"Found metadata in key {key}: {metadata}")
-                            break
-                        except Exception as e:
-                            logger.warning(f"Failed to parse metadata from key {key} in {path}: {e}")
-                if not metadata:
-                    logger.info(f"No metadata found via load_file for {path}, attempting header read")
-                    metadata = read_safetensors_header(path)
-            metadata = {k: str(v) for k, v in metadata.items()}
-            logger.info(f"Metadata for {path}: {metadata}")
-        except Exception as e:
-            logger.warning(f"Failed to load metadata for {path}: {e}")
-            metadata = {}
-    else:
-        path = ""
-    if current_lora["path"] == path:
-        return lora_list, last_valid_lora_state
+    name = os.path.basename(path) if path and path.endswith('.safetensors') else "None"
+    weight = float(current_lora["weight"]) if current_lora.get("weight") else 1.5
+    metadata = read_safetensors_header(path) if path and path.endswith('.safetensors') else {}
     new_list = update_lora(index, name, path, weight, lora_list, metadata)
-    return new_list, new_list  # Update last_valid_lora_state
+    return new_list, new_list
 
 def update_lora_weight(index, weight, lora_list, last_valid_lora_state):
-    """Update LoRA weight, preserving name, path, and metadata."""
-    logger.debug(f"update_lora_weight called with index={index}, weight={weight}, lora_list={lora_list}")
+    logger.debug(f"Updating LoRA weight at index {index} to {weight}")
     if index >= len(lora_list):
         return lora_list, last_valid_lora_state
     current_lora = lora_list[index]
     name = current_lora["name"].split('_')[0] if '_' in current_lora["name"] else current_lora["name"]
-    path = current_lora["path"]
+    path = current_lora.get("path", "")
     metadata = current_lora.get("metadata", {})
-    try:
-        weight = float(weight)
-    except (ValueError, TypeError):
-        weight = 1.5
-    if current_lora["weight"] == weight:
-        return lora_list, last_valid_lora_state
+    weight = float(weight) if weight else 1.5
     new_list = update_lora(index, name, path, weight, lora_list, metadata)
-    return new_list, new_list  # Update last_valid_lora_state
-
-sample_list = [
-    ['./assets/examples/man.jpg', None, 'A sophisticated gentleman exuding confidence. He is dressed in a 1990s brown plaid jacket with a high collar, paired with a dark grey turtleneck. His trousers are tailored and charcoal in color, complemented by a sleek leather belt. The background showcases an elegant library with bookshelves, a marble fireplace, and warm lighting, creating a refined and cozy atmosphere. His relaxed posture and casual hand-in-pocket stance add to his composed and stylish demeanor', 666, [], 'aes_stage2'],
-    ['./assets/examples/man.jpg', './assets/examples/man_pose.jpg', 'A man, portrait, cinematic', 42, [{"name": "realism_1", "path": AVAILABLE_LORAS["realism"], "weight": 1.5, "metadata": {}}], 'aes_stage2'],
-    ['./assets/examples/man.jpg', None, 'A man, portrait, cinematic', 12345, [], 'sim_stage1'],
-    ['./assets/examples/woman.jpg', './assets/examples/woman.jpg', 'A woman, portrait, cinematic', 1621695706, [], 'sim_stage1'],
-    ['./assets/examples/woman.jpg', None, 'A young woman holding a sign with the text "InfiniteYou", "Infinite" in black and "You" in red, pure background', 3724009365, [], 'aes_stage2'],
-    ['./assets/examples/woman.jpg', None, 'A photo of an elegant Javanese bride in traditional attire, with long hair styled into intricate a braid made of many fresh flowers, wearing a delicate headdress made from sequins and beads. She\'s holding flowers, light smiling at the camera, against a backdrop adorned with orchid blooms. The scene captures her grace as she stands amidst soft pastel colors, adding to its dreamy atmosphere', 42, [{"name": "realism_1", "path": AVAILABLE_LORAS["realism"], "weight": 1.5, "metadata": {}}], 'aes_stage2'],
-    ['./assets/examples/woman.jpg', None, 'A photo of an elegant Javanese bride in traditional attire, with long hair styled into intricate a braid made of many fresh flowers, wearing a delicate headdress made from sequins and beads. She\'s holding flowers, light smiling at the camera, against a backdrop adorned with orchid blooms. The scene captures her grace as she stands amidst soft pastel colors, adding to its dreamy atmosphere', 42, [], 'sim_stage1'],
-]
+    return new_list, new_list
 
 with gr.Blocks() as demo:
     session_state = gr.State({})
     default_model_version = "v1.0"
     lora_state = gr.State([{"name": "None", "path": "", "weight": 1.5, "metadata": {}}])
-    custom_loras = gr.State([])  # Store [filename, full_path, metadata] triples
-    active_lora_index = gr.State(0)  # Track which LoRA slot the custom_lora_select targets
-    last_valid_lora_state = gr.State([{"name": "None", "path": "", "weight": 1.5, "metadata": {}}])  # Cache last valid lora_state
+    custom_loras = gr.State([])
+    active_lora_index = gr.State(0)
+    last_valid_lora_state = gr.State([{"name": "None", "path": "", "weight": 1.5, "metadata": {}}])
 
     gr.HTML("""
     <div style="text-align: center; max-width: 900px; margin: 0 auto;">
         <h1 style="font-size: 1.5rem; font-weight: 700; display: block;">InfiniteYou-FLUX</h1>
         <h2 style="font-size: 1.2rem; font-weight: 300; margin-bottom: 1rem; display: block;">Official Gradio Demo for <a href="https://arxiv.org/abs/2503.16418">InfiniteYou: Flexible Photo Recrafting While Preserving Your Identity</a></h2>
-        <a href="https://bytedance.github.io/InfiniteYou">[Project Page]</a> 
-        <a href="https://arxiv.org/abs/2503.16418">[Paper]</a> 
-        <a href="https://github.com/bytedance/InfiniteYou">[Code]</a> 
+        <a href="https://bytedance.github.io/InfiniteYou">[Project Page]</a> 
+        <a href="https://arxiv.org/abs/2503.16418">[Paper]</a> 
+        <a href="https://github.com/bytedance/InfiniteYou">[Code]</a> 
         <a href="https://huggingface.co/ByteDance/InfiniteYou">[Model]</a>
         <style>
             .full-width input[type="text"] {
@@ -713,18 +978,18 @@ with gr.Blocks() as demo:
 
     gr.Markdown("""
     ### 💡 How to Use This Demo:
-    1. **Upload an identity (ID) image containing a human face.** For multiple faces, only the largest face will be detected. The face should ideally be clear and large enough, without significant occlusions or blur.
+    1. **Upload multiple identity (ID) images of the same person's face.** These images will be processed to select the best face, create an averaged composite, or average embeddings based on the "Face Selection Mode". Each image should contain a clear, large face without significant occlusions or blur.
     2. **Enter the text prompt to describe the generated image and select the model version.** Please refer to **important usage tips** under the Generated Image field.
     3. *[Optional] Upload a control image containing a human face.* Only five facial keypoints will be extracted to control the generation. If not provided, we use a black control image, indicating no control.
     4. *[Optional] Adjust advanced hyperparameters or apply optional LoRAs to meet personal needs.* Please refer to **important usage tips** under the Generated Image field.
-    5. **Specify the number of images to generate (default is 1).**
+    5. **Specify the number of images to generate for the identity (default is 1).**
     6. **Click the "Generate" button to generate images.** Enjoy!
     """)
     
     with gr.Row():
         with gr.Column():
             with gr.Row():
-                ui_id_image = gr.Image(label="Identity Image", type="pil", height=370)
+                ui_id_image = gr.File(label="Identity Images (Multiple of Same Face)", file_types=[".png", ".jpg", ".jpeg", ".heif"], file_count="multiple", height=370)
 
                 with gr.Column():
                     ui_control_image = gr.Image(label="Control Image [Optional]", type="pil", height=370)
@@ -738,6 +1003,12 @@ with gr.Blocks() as demo:
 
             ui_btn_generate = gr.Button("Generate")
             with gr.Accordion("Advanced", open=False):
+                with gr.Row():
+                    ui_face_selection_mode = gr.Dropdown(
+                        label="Face Selection Mode",
+                        choices=["best_face", "averaged_face", "averaged_embedding"],
+                        value="best_face",
+                    )
                 with gr.Row():
                     ui_num_steps = gr.Number(label="num steps", value=30)
                     ui_seed = gr.Number(label="seed (0 for random)", value=0)
@@ -754,9 +1025,10 @@ with gr.Blocks() as demo:
                 with gr.Row():
                     ui_quantize_8bit = gr.Checkbox(label="Enable 8-bit quantization", value=True)
                     ui_cpu_offload = gr.Checkbox(label="Enable CPU offloading", value=True)
+                    ui_debug_to_log = gr.Checkbox(label="Debug to Log File", value=False)
                 ui_num_images = gr.Number(label="Number of Images to Generate", value=1, minimum=1, precision=0)
 
-            with gr.Accordion("LoRAs [Optional]", open=True) as lora_accordion:
+            with gr.Accordion("LoRAs [Optional]", open=True):
                 lora_components = []
                 metadata_components = []
                 with gr.Column():
@@ -780,8 +1052,7 @@ with gr.Blocks() as demo:
                             lora_path = gr.Textbox(
                                 label=f"LoRA Path {i+1} (Selected LoRA)",
                                 value="",
-                                visible=False,
-                                elem_id=f"lora-path-{i}"
+                                visible=False
                             )
                             lora_weight = gr.Slider(
                                 label=f"LoRA Weight {i+1}",
@@ -797,152 +1068,132 @@ with gr.Blocks() as demo:
                             value="No metadata available",
                             interactive=False,
                             visible=i == 0,
-                            lines=5,
-                            elem_classes="full-width",
-                            elem_id=f"lora-metadata-{i}"
+                            lines=5
                         )
                         metadata_components.append(lora_metadata)
-                        lora_components[3 + i*6] = lora_metadata  # Replace None with lora_metadata in lora_components
+                        lora_components[3 + i*6] = lora_metadata
 
                         lora_name.change(
                             fn=update_lora_name,
                             inputs=[gr.State(value=i), lora_name, lora_state, last_valid_lora_state],
-                            outputs=[lora_state, last_valid_lora_state],
-                            queue=False
+                            outputs=[lora_state, last_valid_lora_state]
                         ).then(
                             fn=update_lora_fields,
                             inputs=[lora_state, last_valid_lora_state],
-                            outputs=lora_components,
-                            queue=False
+                            outputs=lora_components
                         )
                         lora_path.change(
                             fn=update_lora_path,
                             inputs=[gr.State(value=i), lora_path, lora_state, last_valid_lora_state],
-                            outputs=[lora_state, last_valid_lora_state],
-                            queue=False
+                            outputs=[lora_state, last_valid_lora_state]
                         ).then(
                             fn=update_lora_fields,
                             inputs=[lora_state, last_valid_lora_state],
-                            outputs=lora_components,
-                            queue=False
+                            outputs=lora_components
                         )
                         lora_weight.change(
                             fn=update_lora_weight,
                             inputs=[gr.State(value=i), lora_weight, lora_state, last_valid_lora_state],
-                            outputs=[lora_state, last_valid_lora_state],
-                            queue=False
+                            outputs=[lora_state, last_valid_lora_state]
                         ).then(
                             fn=update_lora_fields,
                             inputs=[lora_state, last_valid_lora_state],
-                            outputs=lora_components,
-                            queue=False
+                            outputs=lora_components
                         )
                         remove_btn.click(
                             fn=remove_lora,
                             inputs=[gr.State(value=i), lora_state, last_valid_lora_state],
-                            outputs=[lora_state, active_lora_index, last_valid_lora_state],
-                            queue=False
+                            outputs=[lora_state, active_lora_index, last_valid_lora_state]
                         ).then(
                             fn=update_lora_fields,
                             inputs=[lora_state, last_valid_lora_state],
-                            outputs=lora_components,
-                            queue=False
+                            outputs=lora_components
                         )
                         custom_lora_select.change(
                             fn=select_custom_lora,
                             inputs=[active_lora_index, custom_lora_select, lora_state, custom_loras, last_valid_lora_state],
-                            outputs=[lora_state, custom_lora_select, last_valid_lora_state],
-                            queue=False
+                            outputs=[lora_state, custom_lora_select, last_valid_lora_state]
                         ).then(
                             fn=update_lora_fields,
                             inputs=[lora_state, last_valid_lora_state],
-                            outputs=lora_components,
-                            queue=False
+                            outputs=lora_components
                         )
 
                     add_lora_btn = gr.Button("Add Another LoRA")
                     add_lora_btn.click(
                         fn=add_lora,
                         inputs=[lora_state, last_valid_lora_state],
-                        outputs=[lora_state, active_lora_index, last_valid_lora_state],
-                        queue=False
+                        outputs=[lora_state, active_lora_index, last_valid_lora_state]
                     ).then(
                         fn=update_lora_fields,
                         inputs=[lora_state, last_valid_lora_state],
-                        outputs=lora_components,
-                        queue=False
+                        outputs=lora_components
                     )
 
                     list_lora_btn.click(
                         fn=list_lora_files,
                         inputs=[lora_dir],
-                        outputs=[custom_loras],
-                        queue=False
+                        outputs=[custom_loras]
                     ).then(
                         fn=lambda cl: gr.update(choices=[name for name, _, _ in cl], value=None),
                         inputs=[custom_loras],
-                        outputs=[custom_lora_select],
-                        queue=False
+                        outputs=[custom_lora_select]
                     )
 
         with gr.Column():
-            image_output = gr.Gallery(label="Generated Images", interactive=False, height=550, format='png')
+            image_output = gr.Gallery(label="Generated Images", interactive=False, height=550)
             gr.Markdown(
                 """
                 ### ❗️ Important Usage Tips:
                 - **Model Version**: `aes_stage2` is used by default for better text-image alignment and aesthetics. For higher ID similarity, try `sim_stage1`.
+                - **Face Selection Mode**: Determines how the identity image is selected from multiple uploaded images:
+                  - **`best_face`**: Analyzes each uploaded image using a face detection model and selects the image with the highest confidence score for a detected face. This mode is ideal when you want the clearest and most reliable single image to represent the identity, prioritizing quality and clarity.
+                  - **`averaged_face`**: Aligns all uploaded images based on facial landmarks (e.g., eyes and nose) to a reference image, then averages the pixel values to create a composite image. This mode is useful for creating a smoothed, representative identity that blends features from multiple images, reducing noise or inconsistencies.
+                  - **`averaged_embedding`**: Extracts ArcFace embeddings (numerical representations of facial features) from each image, averages these embeddings to create a composite embedding, and selects the original image whose embedding is closest to this average. This mode is effective for capturing a consistent identity across varied images by focusing on deep facial features.
                 - **Useful Hyperparameters**: Usually, there is NO need to adjust too much. If necessary, try a slightly larger `--infusenet_guidance_start` (*e.g.*, `0.1`) only (especially helpful for `sim_stage1`). If still not satisfactory, then try a slightly smaller `--infusenet_conditioning_scale` (*e.g.*, `0.9`).
-                - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, specify a directory containing .safetensors files (defaults to `./loras`) and click "Refresh LoRAs". LoRAs are automatically loaded from `./loras` on startup. Select a custom LoRA from the "Select Custom LoRA" dropdown to apply it to the active LoRA field (the most recently added or first available), and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRA metadata (e.g., trigger words, recommended weight) is displayed in the "Metadata for LoRA" field below each LoRA. LoRAs are optional and were NOT used in our paper unless specified.
+                - **Optional LoRAs**: Select built-in LoRAs (e.g., `realism`, `anti-blur`) from the "LoRA" dropdowns. For custom LoRAs, specify a directory containing .safetensors files (defaults to `./lora`) and click "Refresh LoRAs". LoRAs are automatically loaded from `./loras` on startup. Select a custom LoRA from the "Select Custom LoRA" dropdown to apply it to the active LoRA field (the most recently added or first available), and its full path will appear in "LoRA Path". Adjust weights (0.0 to 2.0) to control influence. Add multiple LoRAs with the "Add Another LoRA" button (up to 5), and remove unwanted ones with "Remove". LoRA metadata (e.g., trigger words, recommended weight) is displayed in the "Metadata for LoRA" field below each LoRA. LoRAs are optional and were NOT used in our paper unless specified.
                 - **Gender Prompt**: If the generated gender is not preferred, add specific words in the prompt, such as 'a man', 'a woman', *etc*. We encourage using inclusive and respectful language.
-                - **Performance Options**: Enable `8-bit quantization` to reduce memory usage and `CPU offloading` to use CPU memory for parts of the model, which can help on systems with limited GPU memory.
+                - **Performance Options**: Enable `8-bit quantization` to reduce memory usage and `CPU offloading` to use CPU memory for parts of the model, which can help on systems with limited GPU memory. Enable `Debug to Log File` to write logs to `app.log` and `pipeline.log` for debugging; disable when not needed to avoid unnecessary file writes.
                 - **Automatic Saving**: Generated images are automatically saved to the `./results` folder with filenames like `index_prompt_seed_imgN.png`.
                 - **Reusing Seeds**: The "Last Seeds Used" field shows the seeds from the most recent generation. Copy them to the "seed" input to reuse them.
-                - **Multiple Images**: Specify the number of images to generate (default is 1). Each image uses a unique seed (incremented from the base seed or random if set to 0).
+                - **Multiple Images**: Upload multiple images of the same face to improve identity accuracy. The system selects the best image, averages them, or uses embeddings based on the "Face Selection Mode". Specify the number of output images to generate (default is 1). Each image uses a unique seed (incremented from the base seed or random if set to 0).
+                - **Debugging**: Intermediate images for each face selection mode are saved to `./results/intermediates` (e.g., `best_face_<time>.png`, `averaged_face_<time>.png`, `averaged_embedding_<time>.png`) to verify differences.
                 """
             )
 
-    gr.Examples(
-        sample_list,
-        inputs=[ui_id_image, ui_control_image, ui_prompt_text, ui_seed, lora_state, ui_model_version],
-        outputs=[image_output, ui_last_seed],
-        fn=generate_examples,
-        cache_examples=False,
-    )
-
     ui_btn_generate.click(
-        fn=generate_image, 
+        fn=generate_image,
         inputs=[
-            ui_id_image, 
-            ui_control_image, 
-            ui_prompt_text, 
-            ui_seed, 
+            ui_id_image,
+            ui_control_image,
+            ui_prompt_text,
+            ui_seed,
             ui_width,
             ui_height,
-            ui_guidance_scale, 
-            ui_num_steps, 
-            ui_infusenet_conditioning_scale, 
+            ui_guidance_scale,
+            ui_num_steps,
+            ui_infusenet_conditioning_scale,
             ui_infusenet_guidance_start,
             ui_infusenet_guidance_end,
             lora_state,
             ui_quantize_8bit,
             ui_cpu_offload,
             ui_model_version,
-            ui_num_images
-        ], 
-        outputs=[image_output, ui_last_seed], 
-        concurrency_id="gpu"
+            ui_num_images,
+            ui_face_selection_mode,
+            ui_debug_to_log
+        ],
+        outputs=[image_output, ui_last_seed]
     )
 
     demo.load(
         fn=list_lora_files,
         inputs=[lora_dir],
-        outputs=[custom_loras],
-        queue=False
+        outputs=[custom_loras]
     ).then(
         fn=lambda cl: gr.update(choices=[name for name, _, _ in cl], value=None),
         inputs=[custom_loras],
-        outputs=[custom_lora_select],
-        queue=False
+        outputs=[custom_lora_select]
     )
 
     with gr.Accordion("Local Gradio Demo for Developers", open=False):
@@ -986,5 +1237,6 @@ with gr.Blocks() as demo:
         """
     )
 
-demo.queue()
-demo.launch(server_name='127.0.0.1', share=True)
+if __name__ == "__main__":
+    demo.queue()
+    demo.launch(server_name='127.0.0.1')
