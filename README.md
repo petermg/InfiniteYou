@@ -1,6 +1,42 @@
-<div align="center">
+<div align="left">
+Added the following features: 
+
+
+
+Can now use multiple images for input. They will be process according to the "Face Selection Mode" you pick.
   
-# This fork is modified to support custom LoRAs.
+# best_face: 
+Analyzes each uploaded image using a face detection model and selects the image with the highest confidence score for a detected face. This mode is ideal when you want the clearest and most reliable single image to represent the identity, prioritizing quality and clarity.
+    
+# averaged_face: 
+Aligns all uploaded images based on facial landmarks (e.g., eyes and nose) to a reference image, then averages the pixel values to create a composite image. This mode is useful for creating a smoothed, representative identity that blends features from multiple images, reducing noise or inconsistencies. This works best with clear images of faces in the same position. Works great if you take 2 images of different people looking directly at the camera as it blends them together. This is one of the funnest features for example:
+
+Input images:
+
+![image](https://github.com/user-attachments/assets/d211e247-699b-4d22-a77a-4bf07ab9bcb8) 
+![image](https://github.com/user-attachments/assets/5b62db63-573d-4679-bd63-fa4a4bbf2413)
+
+Intermediate averaged face:
+
+![image](https://github.com/user-attachments/assets/bfdf4f51-6bbf-484a-b72d-75b57ac6fd46)
+
+
+Final Output image:
+
+![image](https://github.com/user-attachments/assets/fbcc18bc-4e1c-4fdf-abf0-987350c6d4f0)
+
+
+
+# averaged_embedding:
+Extracts ArcFace embeddings (numerical representations of facial features) from each image, averages these embeddings to create a composite embedding, and selects the original image whose embedding is closest to this average. This mode is effective for capturing a consistent identity across varied images by focusing on deep facial features.
+   
+
+
+# Custom LoRAs.
+Endless possiblities with custom Flux LoRAs. You can specify the folder by defaul it's "./loras".
+
+# Multiple generations
+You can now specify the number of images you want it to generate when you click on Generate.
 
 ![image](https://github.com/user-attachments/assets/46e5b0e0-635b-43b3-a64d-4a013dbc95a5)
 
