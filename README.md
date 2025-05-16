@@ -37,10 +37,12 @@ Endless possiblities with custom Flux LoRAs. You can specify the folder by defau
 
 # Multiple generations
 You can now specify the number of images you want it to generate when you click on Generate.
-
+##
+  <div align="center">
+    
 ![image](https://github.com/user-attachments/assets/46e5b0e0-635b-43b3-a64d-4a013dbc95a5)
 
-  
+
 ## InfiniteYou: Flexible Photo Recrafting While Preserving Your Identity
 
 [**Liming Jiang**](https://liming-jiang.com/)&nbsp;&nbsp;&nbsp;&nbsp;
