@@ -111,7 +111,7 @@ def download_models():
             logger.error(f"Failed to download InfiniteYou: {e}")
             raise
         try:
-            snapshot_download(repo_id='ChuckMcSneed/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False)
+            snapshot_download(repo_id='ChuckMcSneed/FLUX.1-dev', local_dir='./models/FLUX.1-dev', local_dir_use_symlinks=False, ignore_patterns=["flux1-dev.safetensors", "ae.safetensors"])
             logger.info("Downloaded FLUX.1-dev model")
         except Exception as e:
             logger.error(f"Failed to download FLUX.1-dev: {e}")
